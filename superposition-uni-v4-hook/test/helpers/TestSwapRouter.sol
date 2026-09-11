@@ -27,11 +27,16 @@ contract TestSwapRouter {
         manager = _manager;
     }
 
-    function swap(PoolKey calldata key, bool zeroForOne, int256 amountSpecified, uint160 limit, address payer)
-        external
-        returns (BalanceDelta delta)
-    {
-        bytes memory result = manager.unlock(abi.encode(CallbackData(key, zeroForOne, amountSpecified, limit, payer)));
+    function swap(
+        PoolKey calldata key,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 limit,
+        address payer
+    ) external returns (BalanceDelta delta) {
+        bytes memory result = manager.unlock(
+            abi.encode(CallbackData(key, zeroForOne, amountSpecified, limit, payer))
+        );
         delta = abi.decode(result, (BalanceDelta));
     }
 
@@ -51,16 +56,14 @@ contract TestSwapRouter {
 
         if (delta.amount0() < 0) {
             manager.sync(data.key.currency0);
-            IERC20(Currency.unwrap(data.key.currency0)).safeTransferFrom(
-                data.payer, address(manager), uint256(uint128(-delta.amount0()))
-            );
+            IERC20(Currency.unwrap(data.key.currency0))
+                .safeTransferFrom(data.payer, address(manager), uint256(uint128(-delta.amount0())));
             manager.settle();
         }
         if (delta.amount1() < 0) {
             manager.sync(data.key.currency1);
-            IERC20(Currency.unwrap(data.key.currency1)).safeTransferFrom(
-                data.payer, address(manager), uint256(uint128(-delta.amount1()))
-            );
+            IERC20(Currency.unwrap(data.key.currency1))
+                .safeTransferFrom(data.payer, address(manager), uint256(uint128(-delta.amount1())));
             manager.settle();
         }
         if (delta.amount0() > 0) {
