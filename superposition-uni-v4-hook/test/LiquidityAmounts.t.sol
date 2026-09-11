@@ -17,7 +17,8 @@ contract LiquidityAmountsTest is Test {
     function test_in_range_round_trip() public pure {
         (uint160 lower, uint160 upper) = _ticks();
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(SPOT, lower, upper, 1e18, 1e18);
-        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(SPOT, lower, upper, liquidity);
+        (uint256 amount0, uint256 amount1) =
+            LiquidityAmounts.getAmountsForLiquidity(SPOT, lower, upper, liquidity);
         assertGt(amount0, 0);
         assertGt(amount1, 0);
         assertLe(amount0, 1e18);
@@ -28,7 +29,8 @@ contract LiquidityAmountsTest is Test {
         (uint160 lower, uint160 upper) = _ticks();
         uint160 spot = TickMath.getSqrtPriceAtTick(-120); // below lower
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(spot, lower, upper, 1e18, 0);
-        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(spot, lower, upper, liquidity);
+        (uint256 amount0, uint256 amount1) =
+            LiquidityAmounts.getAmountsForLiquidity(spot, lower, upper, liquidity);
         assertGt(amount0, 0);
         assertEq(amount1, 0);
     }
@@ -37,7 +39,8 @@ contract LiquidityAmountsTest is Test {
         (uint160 lower, uint160 upper) = _ticks();
         uint160 spot = TickMath.getSqrtPriceAtTick(120); // above upper
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(spot, lower, upper, 0, 1e18);
-        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(spot, lower, upper, liquidity);
+        (uint256 amount0, uint256 amount1) =
+            LiquidityAmounts.getAmountsForLiquidity(spot, lower, upper, liquidity);
         assertEq(amount0, 0);
         assertGt(amount1, 0);
     }

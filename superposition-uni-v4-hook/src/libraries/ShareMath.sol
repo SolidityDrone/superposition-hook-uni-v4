@@ -18,7 +18,11 @@ library ShareMath {
         return Math.mulDiv(assets, totalShares + VIRTUAL_SHARES, totalAssetsBefore + VIRTUAL_ASSETS);
     }
 
-    function toAssets(uint256 shares, uint256 totalAssets, uint256 totalSupply) internal pure returns (uint256) {
+    function toAssets(uint256 shares, uint256 totalAssets, uint256 totalSupply)
+        internal
+        pure
+        returns (uint256)
+    {
         return Math.mulDiv(shares, totalAssets + VIRTUAL_ASSETS, totalSupply + VIRTUAL_SHARES);
     }
 }
