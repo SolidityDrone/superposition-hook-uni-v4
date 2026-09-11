@@ -47,7 +47,7 @@ contract SuperpositionHook is IHooks, Ownable {
 
     uint256 internal constant WAD = 1e18;
     uint256 internal constant FEED_SCALE = 1e8;
-    uint256 internal constant DEPOSIT_BUFFER = 5;
+    uint256 internal constant DEPOSIT_BUFFER = 1000;
 
     struct Range {
         int24 lower;

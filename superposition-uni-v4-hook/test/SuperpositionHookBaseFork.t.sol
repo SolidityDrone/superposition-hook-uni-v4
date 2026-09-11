@@ -141,8 +141,8 @@ contract SuperpositionHookBaseForkTest is Test {
         assertEq(hook.getRanges().length, 1);
 
         (uint256 w, uint256 u) = hook.currentBalance();
-        assertApproxEqAbs(w, exp0, 10);
-        assertApproxEqAbs(u, exp1, 10);
+        assertApproxEqAbs(w, exp0, 1100);
+        assertApproxEqAbs(u, exp1, 1100);
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
         assertEq(IERC20(USDC).balanceOf(address(hook)), 0);
         assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
@@ -194,8 +194,8 @@ contract SuperpositionHookBaseForkTest is Test {
 
         assertEq(IERC20(WETH).balanceOf(lp) - wBefore, wOut);
         assertEq(IERC20(USDC).balanceOf(lp) - uBefore, uOut);
-        assertApproxEqAbs(wOut, exp0, 10);
-        assertApproxEqAbs(uOut, exp1, 10);
+        assertApproxEqAbs(wOut, exp0, 1100);
+        assertApproxEqAbs(uOut, exp1, 1100);
         assertEq(hook.balanceOf(lp), 0);
         assertEq(hook.totalSupply(), 0);
         assertApproxEqAbs(hook.totalAssets(), 0, 10);
@@ -208,8 +208,8 @@ contract SuperpositionHookBaseForkTest is Test {
         vm.prank(lp);
         (uint256 wOut, uint256 uOut) = hook.withdraw(half, lp);
 
-        assertApproxEqAbs(wOut, exp0 / 2, 10);
-        assertApproxEqAbs(uOut, exp1 / 2, 10);
+        assertApproxEqAbs(wOut, exp0 / 2, 1100);
+        assertApproxEqAbs(uOut, exp1 / 2, 1100);
         assertEq(hook.balanceOf(lp), shares - half);
         SuperpositionHook.Range[] memory rs = hook.getRanges();
         assertApproxEqAbs(uint256(rs[0].liquidity), uint256(liq) / 2, uint256(liq) / 1000);
@@ -441,6 +441,46 @@ contract SuperpositionHookBaseForkTest is Test {
         assertApproxEqAbs(hook.totalAssets(), 0, 10);
         SuperpositionHook.Range[] memory rs = hook.getRanges();
         assertFalse(rs[0].active);
+    }
+
+    /// @notice Aave rejecting the post-swap supply for one token leaves it idle; the vault keeps
+    ///         working and the idle (real) balance is spent alongside the virtual liquidity.
+    function test_fork_partial_aave_supply_stays_correct() public {
+        _depositDefault(1e18, 3000e6);
+
+        // Only the USDC supply leg fails from now on (simulated Aave cap).
+        vm.mockCallRevert(
+            AAVE, abi.encodeWithSelector(IAavePool.supply.selector, USDC), bytes("cap")
+        );
+
+        TestSwapRouter router = new TestSwapRouter(PM);
+        vm.startPrank(lp);
+        IERC20(WETH).approve(address(router), type(uint256).max);
+        IERC20(USDC).approve(address(router), type(uint256).max);
+        vm.stopPrank();
+
+        vm.prank(lp);
+        router.swap(_poolKey(), true, -0.01e18, TickMath.MIN_SQRT_PRICE + 1, lp);
+
+        // WETH went back to Aave; USDC could not and stays as a real idle balance.
+        assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
+        assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
+        assertGt(IERC20(USDC).balanceOf(address(hook)), 0);
+        assertFalse(hook.jitActive());
+        assertGt(hook.totalAssets(), 0);
+
+        // A second swap is funded from the idle USDC plus the aWETH and still settles.
+        vm.prank(lp);
+        router.swap(_poolKey(), false, -3000e6, TickMath.MAX_SQRT_PRICE - 1, lp);
+        assertFalse(hook.jitActive());
+        assertGt(IERC20(USDC).balanceOf(address(hook)), 0);
+
+        // Full exit returns both the Aave-held and the idle tokens.
+        uint256 shares = hook.balanceOf(lp);
+        vm.prank(lp);
+        (uint256 wOut, uint256 uOut) = hook.withdraw(shares, lp);
+        assertGt(wOut + uOut, 0);
+        assertEq(hook.balanceOf(lp), 0);
     }
 }
 
