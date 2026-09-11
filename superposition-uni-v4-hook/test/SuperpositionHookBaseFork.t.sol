@@ -16,6 +16,7 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {SuperpositionHook} from "../src/SuperpositionHook.sol";
 import {LiquidityAmounts} from "../src/libraries/LiquidityAmounts.sol";
 import {IAggregatorV3} from "../src/interfaces/IAggregatorV3.sol";
+import {IAavePool} from "../src/interfaces/IAavePool.sol";
 import {HookMiner} from "./utils/HookMiner.sol";
 import {TestSwapRouter} from "./helpers/TestSwapRouter.sol";
 
@@ -293,5 +294,62 @@ contract SuperpositionHookBaseForkTest is Test {
         assertLt(aUsdcAfter, usdcBefore);
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
         assertEq(IERC20(USDC).balanceOf(address(hook)), 0);
+    }
+
+    function test_fork_yield_accrual_and_atomic_exit_fairness() public {
+        (uint256 bobShares,,,,,) = _depositDefault(1e18, 3000e6);
+
+        // Simulate accrued yield: the vault's real holdings grow, so `totalAssets` grows.
+        deal(WETH, address(hook), IERC20(WETH).balanceOf(address(hook)) + 0.5e18);
+        deal(USDC, address(hook), IERC20(USDC).balanceOf(address(hook)) + 1500e6);
+
+        assertGt(hook.sharePrice(), 1e18);
+        uint256 bobClaimBefore = hook.convertToAssets(bobShares);
+
+        // Alice joins and exits atomically at the post-yield price.
+        int24 base = _floor(currentTick, 10);
+        vm.startPrank(lp);
+        uint256 aliceShares = hook.deposit(
+            SuperpositionHook.DepositParams({
+                tickLower: base - 600,
+                tickUpper: base + 600,
+                amount0Desired: 1e18,
+                amount1Desired: 3000e6,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: lp
+            })
+        );
+        hook.withdraw(aliceShares, lp);
+        vm.stopPrank();
+
+        // Bob's claim is unchanged: Alice did not skim his yield.
+        uint256 bobClaimAfter = hook.convertToAssets(bobShares);
+        assertApproxEqRel(bobClaimAfter, bobClaimBefore, 0.001e18);
+    }
+
+    function test_fork_deposit_survives_aave_failure() public {
+        vm.mockCallRevert(AAVE, IAavePool.supply.selector, bytes("supply failed"));
+
+        int24 base = _floor(currentTick, 10);
+        vm.prank(lp);
+        uint256 shares = hook.deposit(
+            SuperpositionHook.DepositParams({
+                tickLower: base - 600,
+                tickUpper: base + 600,
+                amount0Desired: 1e18,
+                amount1Desired: 3000e6,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: lp
+            })
+        );
+
+        assertGt(shares, 0);
+        assertEq(IERC20(AWETH).balanceOf(address(hook)), 0);
+        assertEq(IERC20(AUSDC).balanceOf(address(hook)), 0);
+        assertGt(IERC20(WETH).balanceOf(address(hook)), 0);
+        assertGt(IERC20(USDC).balanceOf(address(hook)), 0);
+        assertGt(hook.totalAssets(), 0);
     }
 }
