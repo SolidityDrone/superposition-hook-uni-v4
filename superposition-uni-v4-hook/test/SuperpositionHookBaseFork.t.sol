@@ -228,4 +228,70 @@ contract SuperpositionHookBaseForkTest is Test {
         assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
         assertFalse(hook.jitActive());
     }
+
+    function test_fork_one_sided_usdc_limit_order() public {
+        int24 base = _floor(currentTick, 10);
+        int24 tickUpper = base - 10; // fully below spot: only token1 (USDC) is required
+        int24 tickLower = tickUpper - 600;
+
+        vm.prank(lp);
+        uint256 shares = hook.deposit(
+            SuperpositionHook.DepositParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                amount0Desired: 0,
+                amount1Desired: 3000e6,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: lp
+            })
+        );
+
+        assertGt(shares, 0);
+        assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
+        assertEq(IERC20(AWETH).balanceOf(address(hook)), 0);
+        assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
+
+        (uint256 vw, uint256 vu) = hook.virtualBalance();
+        assertEq(vw, 0);
+        assertGt(vu, 0);
+    }
+
+    function test_fork_limit_order_fills_on_cross() public {
+        int24 base = _floor(currentTick, 10);
+        int24 tickUpper = base - 10;
+        int24 tickLower = tickUpper - 600;
+
+        vm.prank(lp);
+        hook.deposit(
+            SuperpositionHook.DepositParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                amount0Desired: 0,
+                amount1Desired: 3000e6,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: lp
+            })
+        );
+
+        uint256 usdcBefore = IERC20(AUSDC).balanceOf(address(hook));
+        assertEq(IERC20(AWETH).balanceOf(address(hook)), 0);
+
+        TestSwapRouter router = new TestSwapRouter(PM);
+        vm.startPrank(lp);
+        IERC20(WETH).approve(address(router), type(uint256).max);
+        vm.stopPrank();
+
+        // Push price down into the USDC-only range; the limit order sells USDC for WETH.
+        vm.prank(lp);
+        router.swap(_poolKey(), true, -0.05e18, TickMath.MIN_SQRT_PRICE + 1, lp);
+
+        uint256 aWethAfter = IERC20(AWETH).balanceOf(address(hook));
+        uint256 aUsdcAfter = IERC20(AUSDC).balanceOf(address(hook));
+        assertGt(aWethAfter, 0);
+        assertLt(aUsdcAfter, usdcBefore);
+        assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
+        assertEq(IERC20(USDC).balanceOf(address(hook)), 0);
+    }
 }

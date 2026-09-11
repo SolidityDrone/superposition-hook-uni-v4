@@ -158,9 +158,12 @@ contract SuperpositionHook is IHooks, Ownable {
 
         uint160 sqrtLower = TickMath.getSqrtPriceAtTick(p.tickLower);
         uint160 sqrtUpper = TickMath.getSqrtPriceAtTick(p.tickUpper);
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtP, sqrtLower, sqrtUpper, p.amount0Desired, p.amount1Desired
-        );
+
+        // Reserve the rounding buffer from the user's budget so the pulled amount never exceeds
+        // `amountDesired`.
+        uint256 eff0 = p.amount0Desired > DEPOSIT_BUFFER ? p.amount0Desired - DEPOSIT_BUFFER : 0;
+        uint256 eff1 = p.amount1Desired > DEPOSIT_BUFFER ? p.amount1Desired - DEPOSIT_BUFFER : 0;
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(sqrtP, sqrtLower, sqrtUpper, eff0, eff1);
         if (liquidity == 0) revert NoLiquidity();
 
         (uint256 amount0, uint256 amount1) = _requiredAmounts(sqrtP, sqrtLower, sqrtUpper, liquidity);
