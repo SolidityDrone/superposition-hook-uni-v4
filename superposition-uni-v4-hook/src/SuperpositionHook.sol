@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
@@ -25,6 +26,7 @@ import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
 ///         between swaps and issues ERC-4626 style internal shares.
 contract SuperpositionHook is IHooks, Ownable {
     using PoolIdLibrary for PoolKey;
+    using SafeERC20 for IERC20;
 
     error NotPoolManager();
     error HookNotImplemented();
@@ -140,6 +142,50 @@ contract SuperpositionHook is IHooks, Ownable {
         if (initialized) revert AlreadyInitialized();
         poolManager.initialize(poolKey, sqrtPriceX96);
         initialized = true;
+    }
+
+    /// @notice Add liquidity to a tick range. Tokens are supplied to Aave and shares are minted.
+    function deposit(DepositParams calldata p) external notJit returns (uint256 sharesMinted) {
+        if (!initialized) revert PoolNotInitialized();
+        if (p.tickLower >= p.tickUpper) revert InvalidRange();
+        if (p.tickLower % poolKey.tickSpacing != 0 || p.tickUpper % poolKey.tickSpacing != 0) {
+            revert InvalidRange();
+        }
+
+        (uint160 sqrtP,,,) = StateLibrary.getSlot0(poolManager, poolId);
+        if (sqrtP == 0) revert PoolNotInitialized();
+
+        uint160 sqrtLower = TickMath.getSqrtPriceAtTick(p.tickLower);
+        uint160 sqrtUpper = TickMath.getSqrtPriceAtTick(p.tickUpper);
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtP, sqrtLower, sqrtUpper, p.amount0Desired, p.amount1Desired
+        );
+        if (liquidity == 0) revert NoLiquidity();
+
+        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(sqrtP, sqrtLower, sqrtUpper, liquidity);
+        if (amount0 < p.amount0Min || amount1 < p.amount1Min) revert Slippage();
+
+        uint256 preTotal = totalAssets();
+
+        if (amount0 > 0) weth.safeTransferFrom(msg.sender, address(this), amount0);
+        if (amount1 > 0) usdc.safeTransferFrom(msg.sender, address(this), amount1);
+
+        _addRange(p.tickLower, p.tickUpper, liquidity);
+        _supply(weth, amount0);
+        _supply(usdc, amount1);
+
+        uint256 value = _value(amount0, amount1);
+        if (totalShares == 0) {
+            if (value <= MINIMUM_SHARES) revert ZeroShares();
+            _mint(address(0), MINIMUM_SHARES);
+            sharesMinted = ShareMath.toShares(value, preTotal, totalShares) - MINIMUM_SHARES;
+        } else {
+            sharesMinted = ShareMath.toShares(value, preTotal, totalShares);
+        }
+        if (sharesMinted == 0) revert ZeroShares();
+        _mint(p.recipient, sharesMinted);
+
+        emit Deposited(p.recipient, p.tickLower, p.tickUpper, liquidity, amount0, amount1, sharesMinted);
     }
 
     //////////////////////////////////////////////////////////////////
@@ -298,5 +344,28 @@ contract SuperpositionHook is IHooks, Ownable {
     function _burn(address from, uint256 amount) internal {
         balanceOf[from] -= amount;
         totalShares -= amount;
+    }
+
+    function _addRange(int24 lower, int24 upper, uint128 liquidity) internal {
+        bytes32 key = keccak256(abi.encodePacked(lower, upper));
+        uint256 idx = rangeIndex[key];
+        if (idx == 0) {
+            ranges.push(Range({lower: lower, upper: upper, liquidity: liquidity, active: true}));
+            rangeIndex[key] = ranges.length; // 1-based
+        } else {
+            Range storage r = ranges[idx - 1];
+            r.liquidity += liquidity;
+            r.active = true;
+        }
+    }
+
+    /// @dev Supplies `amount` to Aave. On failure (paused/frozen reserve) tokens stay idle.
+    function _supply(IERC20 token, uint256 amount) internal {
+        if (amount == 0) return;
+        token.forceApprove(aavePool, amount);
+        try IAavePool(aavePool).supply(address(token), amount, address(this), 0) {}
+        catch {
+            token.forceApprove(aavePool, 0);
+        }
     }
 }

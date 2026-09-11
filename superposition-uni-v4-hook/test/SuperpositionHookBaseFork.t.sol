@@ -10,6 +10,7 @@ import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 import {SuperpositionHook} from "../src/SuperpositionHook.sol";
+import {LiquidityAmounts} from "../src/libraries/LiquidityAmounts.sol";
 import {IAggregatorV3} from "../src/interfaces/IAggregatorV3.sol";
 import {HookMiner} from "./utils/HookMiner.sol";
 
@@ -71,5 +72,56 @@ contract SuperpositionHookBaseForkTest is Test {
         assertEq(hook.totalAssets(), 0);
         assertEq(hook.sharePrice(), 1e18);
         assertEq(hook.getRanges().length, 0);
+    }
+
+    function _floor(int24 tick, int24 spacing) internal pure returns (int24) {
+        int24 compressed = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) compressed--;
+        return compressed * spacing;
+    }
+
+    function test_fork_deposit_two_sided() public {
+        int24 base = _floor(currentTick, 10);
+        int24 lower = base - 600;
+        int24 upper = base + 600;
+        uint256 amount0Desired = 1e18;
+        uint256 amount1Desired = 3000e6;
+
+        uint128 liq = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(lower),
+            TickMath.getSqrtPriceAtTick(upper),
+            amount0Desired,
+            amount1Desired
+        );
+        (uint256 exp0, uint256 exp1) = LiquidityAmounts.getAmountsForLiquidity(
+            sqrtPriceX96, TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), liq
+        );
+
+        vm.prank(lp);
+        uint256 shares = hook.deposit(
+            SuperpositionHook.DepositParams({
+                tickLower: lower,
+                tickUpper: upper,
+                amount0Desired: amount0Desired,
+                amount1Desired: amount1Desired,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: lp
+            })
+        );
+
+        assertGt(shares, 0);
+        assertEq(hook.balanceOf(lp), shares);
+        assertEq(hook.getRanges().length, 1);
+
+        (uint256 w, uint256 u) = hook.currentBalance();
+        assertApproxEqAbs(w, exp0, 1);
+        assertApproxEqAbs(u, exp1, 1);
+        assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
+        assertEq(IERC20(USDC).balanceOf(address(hook)), 0);
+        assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
+        assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
+        assertGt(hook.totalAssets(), 0);
     }
 }
