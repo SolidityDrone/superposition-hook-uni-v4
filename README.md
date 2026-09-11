@@ -533,9 +533,22 @@ initializes the WETH/USDC pool at the price implied by the live Chainlink feeds.
 
 Pool: WETH `currency0`, USDC `currency1`, fee `500`, tickSpacing `10`.
 
-For reference, the contract was also validated on a **Base mainnet fork** (v4 `0x4985…2b2b`,
-Aave `0xA238…1c5`, Circle USDC `0x8335…2913`). The mainnet fork suite is kept in the repo; the
-deployment script targets Base Sepolia.
+**Base mainnet (8453) addresses (reference)**
+
+The contract was also validated on a Base mainnet fork. The mainnet fork suite stays in the repo;
+the deployment script targets Base Sepolia.
+
+| Contract | Address |
+|---|---|
+| v4 `PoolManager` | `0x498581fF718922c3f8e6A244956aF099B2652b2b` |
+| Aave v3 `Pool` | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5` |
+| WETH / aWETH | `0x4200000000000000000000000000000000000006` / `0xD4a0e0b9149BCEE3C920d2E00b5dE09138fd8bb7` |
+| USDC (Circle) / aUSDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` / `0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB` |
+| Chainlink ETH/USD | `0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70` |
+| Chainlink USDC/USD | `0x7e860098F58bBFC8648a4311b374B1D669a2bc6B` |
+
+On mainnet the pool uses the Circle USDC (`0x8335…2913`) because that is Aave's listed USDC
+reserve there.
 
 ## Build
 
