@@ -41,7 +41,6 @@ contract SuperpositionHook is IHooks, Ownable {
     error InsufficientShares();
     error StalePrice();
 
-    uint256 internal constant MINIMUM_SHARES = 1e3;
     uint256 internal constant WAD = 1e18;
     uint256 internal constant FEED_SCALE = 1e8;
 
@@ -175,17 +174,45 @@ contract SuperpositionHook is IHooks, Ownable {
         _supply(usdc, amount1);
 
         uint256 value = _value(amount0, amount1);
-        if (totalShares == 0) {
-            if (value <= MINIMUM_SHARES) revert ZeroShares();
-            _mint(address(0), MINIMUM_SHARES);
-            sharesMinted = ShareMath.toShares(value, preTotal, totalShares) - MINIMUM_SHARES;
-        } else {
-            sharesMinted = ShareMath.toShares(value, preTotal, totalShares);
-        }
+        sharesMinted = ShareMath.toShares(value, preTotal, totalShares);
         if (sharesMinted == 0) revert ZeroShares();
         _mint(p.recipient, sharesMinted);
 
         emit Deposited(p.recipient, p.tickLower, p.tickUpper, liquidity, amount0, amount1, sharesMinted);
+    }
+
+    /// @notice Burn shares and receive a pro-rata slice of the vault's real holdings.
+    function withdraw(uint256 shareAmount, address recipient)
+        external
+        notJit
+        returns (uint256 wethOut, uint256 usdcOut)
+    {
+        if (shareAmount == 0) revert ZeroShares();
+        if (balanceOf[msg.sender] < shareAmount) revert InsufficientShares();
+
+        uint256 supply = totalShares;
+        _reduceRanges(shareAmount, supply);
+
+        uint256 aWethBal = aWeth.balanceOf(address(this));
+        uint256 aUsdcBal = aUsdc.balanceOf(address(this));
+        uint256 wethIdle = weth.balanceOf(address(this));
+        uint256 usdcIdle = usdc.balanceOf(address(this));
+
+        uint256 aWethOut = Math.mulDiv(aWethBal, shareAmount, supply);
+        uint256 aUsdcOut = Math.mulDiv(aUsdcBal, shareAmount, supply);
+        uint256 wethIdleOut = Math.mulDiv(wethIdle, shareAmount, supply);
+        uint256 usdcIdleOut = Math.mulDiv(usdcIdle, shareAmount, supply);
+
+        if (aWethOut > 0) IAavePool(aavePool).withdraw(address(weth), aWethOut, recipient);
+        if (aUsdcOut > 0) IAavePool(aavePool).withdraw(address(usdc), aUsdcOut, recipient);
+        if (wethIdleOut > 0) weth.safeTransfer(recipient, wethIdleOut);
+        if (usdcIdleOut > 0) usdc.safeTransfer(recipient, usdcIdleOut);
+
+        wethOut = aWethOut + wethIdleOut;
+        usdcOut = aUsdcOut + usdcIdleOut;
+
+        _burn(msg.sender, shareAmount);
+        emit Withdrawn(msg.sender, recipient, shareAmount, wethOut, usdcOut);
     }
 
     //////////////////////////////////////////////////////////////////
@@ -366,6 +393,22 @@ contract SuperpositionHook is IHooks, Ownable {
         try IAavePool(aavePool).supply(address(token), amount, address(this), 0) {}
         catch {
             token.forceApprove(aavePool, 0);
+        }
+    }
+
+    /// @dev Shrinks every active range proportionally to the shares being redeemed.
+    function _reduceRanges(uint256 shareAmount, uint256 supply) internal {
+        uint256 len = ranges.length;
+        for (uint256 i = 0; i < len; i++) {
+            Range storage r = ranges[i];
+            if (!r.active || r.liquidity == 0) continue;
+            uint128 dec = uint128(Math.mulDiv(r.liquidity, shareAmount, supply));
+            if (dec >= r.liquidity) {
+                r.liquidity = 0;
+                r.active = false;
+            } else {
+                r.liquidity -= dec;
+            }
         }
     }
 }

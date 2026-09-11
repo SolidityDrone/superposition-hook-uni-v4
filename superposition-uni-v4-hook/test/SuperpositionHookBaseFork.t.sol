@@ -124,4 +124,66 @@ contract SuperpositionHookBaseForkTest is Test {
         assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
         assertGt(hook.totalAssets(), 0);
     }
+
+    function _depositDefault(uint256 amount0Desired, uint256 amount1Desired)
+        internal
+        returns (uint256 shares, uint128 liq, uint256 exp0, uint256 exp1, int24 lower, int24 upper)
+    {
+        int24 base = _floor(currentTick, 10);
+        lower = base - 600;
+        upper = base + 600;
+        liq = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(lower),
+            TickMath.getSqrtPriceAtTick(upper),
+            amount0Desired,
+            amount1Desired
+        );
+        (exp0, exp1) = LiquidityAmounts.getAmountsForLiquidity(
+            sqrtPriceX96, TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), liq
+        );
+        vm.prank(lp);
+        shares = hook.deposit(
+            SuperpositionHook.DepositParams({
+                tickLower: lower,
+                tickUpper: upper,
+                amount0Desired: amount0Desired,
+                amount1Desired: amount1Desired,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: lp
+            })
+        );
+    }
+
+    function test_fork_withdraw_returns_principal() public {
+        (uint256 shares,, uint256 exp0, uint256 exp1,,) = _depositDefault(1e18, 3000e6);
+
+        uint256 wBefore = IERC20(WETH).balanceOf(lp);
+        uint256 uBefore = IERC20(USDC).balanceOf(lp);
+        vm.prank(lp);
+        (uint256 wOut, uint256 uOut) = hook.withdraw(shares, lp);
+
+        assertEq(IERC20(WETH).balanceOf(lp) - wBefore, wOut);
+        assertEq(IERC20(USDC).balanceOf(lp) - uBefore, uOut);
+        assertApproxEqAbs(wOut, exp0, 2);
+        assertApproxEqAbs(uOut, exp1, 2);
+        assertEq(hook.balanceOf(lp), 0);
+        assertEq(hook.totalSupply(), 0);
+        assertApproxEqAbs(hook.totalAssets(), 0, 2);
+    }
+
+    function test_fork_withdraw_half() public {
+        (uint256 shares, uint128 liq, uint256 exp0, uint256 exp1,,) = _depositDefault(1e18, 3000e6);
+
+        uint256 half = shares / 2;
+        vm.prank(lp);
+        (uint256 wOut, uint256 uOut) = hook.withdraw(half, lp);
+
+        assertApproxEqAbs(wOut, exp0 / 2, 2);
+        assertApproxEqAbs(uOut, exp1 / 2, 2);
+        assertEq(hook.balanceOf(lp), shares - half);
+        SuperpositionHook.Range[] memory rs = hook.getRanges();
+        assertApproxEqAbs(uint256(rs[0].liquidity), uint256(liq) / 2, uint256(liq) / 1000);
+    }
 }
