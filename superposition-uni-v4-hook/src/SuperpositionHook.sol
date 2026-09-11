@@ -12,7 +12,10 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {
+    BeforeSwapDelta,
+    BeforeSwapDeltaLibrary
+} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
@@ -93,7 +96,13 @@ contract SuperpositionHook is IHooks, Ownable {
         uint256 amount1,
         uint256 shares
     );
-    event Withdrawn(address indexed owner, address indexed recipient, uint256 shares, uint256 amount0, uint256 amount1);
+    event Withdrawn(
+        address indexed owner,
+        address indexed recipient,
+        uint256 shares,
+        uint256 amount0,
+        uint256 amount1
+    );
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -113,8 +122,9 @@ contract SuperpositionHook is IHooks, Ownable {
         address _aWeth,
         address _aUsdc,
         IAggregatorV3 _ethUsdFeed,
-        IAggregatorV3 _usdcUsdFeed
-    ) Ownable(msg.sender) {
+        IAggregatorV3 _usdcUsdFeed,
+        address initialOwner
+    ) Ownable(initialOwner) {
         require(_weth < _usdc, "currencies out of order");
         poolManager = _poolManager;
         aavePool = _aavePool;
@@ -163,10 +173,12 @@ contract SuperpositionHook is IHooks, Ownable {
         // `amountDesired`.
         uint256 eff0 = p.amount0Desired > DEPOSIT_BUFFER ? p.amount0Desired - DEPOSIT_BUFFER : 0;
         uint256 eff1 = p.amount1Desired > DEPOSIT_BUFFER ? p.amount1Desired - DEPOSIT_BUFFER : 0;
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(sqrtP, sqrtLower, sqrtUpper, eff0, eff1);
+        uint128 liquidity =
+            LiquidityAmounts.getLiquidityForAmounts(sqrtP, sqrtLower, sqrtUpper, eff0, eff1);
         if (liquidity == 0) revert NoLiquidity();
 
-        (uint256 amount0, uint256 amount1) = _requiredAmounts(sqrtP, sqrtLower, sqrtUpper, liquidity);
+        (uint256 amount0, uint256 amount1) =
+            _requiredAmounts(sqrtP, sqrtLower, sqrtUpper, liquidity);
         if (amount0 < p.amount0Min || amount1 < p.amount1Min) revert Slippage();
 
         // Aave's liquidity index rounds balances down by a few wei; keep a tiny buffer so the
@@ -245,7 +257,10 @@ contract SuperpositionHook is IHooks, Ownable {
             Range memory r = ranges[i];
             if (!r.active || r.liquidity == 0) continue;
             (uint256 a0, uint256 a1) = LiquidityAmounts.getAmountsForLiquidity(
-                sqrtP, TickMath.getSqrtPriceAtTick(r.lower), TickMath.getSqrtPriceAtTick(r.upper), r.liquidity
+                sqrtP,
+                TickMath.getSqrtPriceAtTick(r.lower),
+                TickMath.getSqrtPriceAtTick(r.upper),
+                r.liquidity
             );
             wethAmt += a0;
             usdcAmt += a1;
@@ -286,16 +301,20 @@ contract SuperpositionHook is IHooks, Ownable {
         revert HookNotImplemented();
     }
 
-    function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) {
+    function afterInitialize(address, PoolKey calldata, uint160, int24)
+        external
+        pure
+        returns (bytes4)
+    {
         revert HookNotImplemented();
     }
 
-    function beforeAddLiquidity(address sender, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, bytes calldata)
-        external
-        view
-        onlyPoolManager
-        returns (bytes4)
-    {
+    function beforeAddLiquidity(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external view onlyPoolManager returns (bytes4) {
         if (sender != address(this)) revert OnlyHook();
         return IHooks.beforeAddLiquidity.selector;
     }
@@ -332,11 +351,12 @@ contract SuperpositionHook is IHooks, Ownable {
         return (IHooks.afterRemoveLiquidity.selector, BalanceDelta.wrap(0));
     }
 
-    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, bytes calldata)
-        external
-        onlyPoolManager
-        returns (bytes4, BeforeSwapDelta, uint24)
-    {
+    function beforeSwap(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata,
+        bytes calldata
+    ) external onlyPoolManager returns (bytes4, BeforeSwapDelta, uint24) {
         if (_activeLiquidity() == 0) revert NoLiquidity();
 
         jitActive = true;
@@ -366,11 +386,13 @@ contract SuperpositionHook is IHooks, Ownable {
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function afterSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, BalanceDelta, bytes calldata)
-        external
-        onlyPoolManager
-        returns (bytes4, int128)
-    {
+    function afterSwap(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata,
+        BalanceDelta,
+        bytes calldata
+    ) external onlyPoolManager returns (bytes4, int128) {
         int256 take0;
         int256 take1;
         uint256 len = ranges.length;
@@ -400,11 +422,19 @@ contract SuperpositionHook is IHooks, Ownable {
         return (IHooks.afterSwap.selector, 0);
     }
 
-    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
+    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
         revert HookNotImplemented();
     }
 
-    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
+    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
         revert HookNotImplemented();
     }
 
@@ -428,11 +458,12 @@ contract SuperpositionHook is IHooks, Ownable {
     }
 
     /// @dev Token amounts a range needs at `sqrtP`, rounded UP exactly like the PoolManager does.
-    function _requiredAmounts(uint160 sqrtP, uint160 sqrtLower, uint160 sqrtUpper, uint128 liquidity)
-        internal
-        pure
-        returns (uint256 amount0, uint256 amount1)
-    {
+    function _requiredAmounts(
+        uint160 sqrtP,
+        uint160 sqrtLower,
+        uint160 sqrtUpper,
+        uint128 liquidity
+    ) internal pure returns (uint256 amount0, uint256 amount1) {
         if (sqrtP <= sqrtLower) {
             amount0 = SqrtPriceMath.getAmount0Delta(sqrtLower, sqrtUpper, liquidity, true);
         } else if (sqrtP < sqrtUpper) {
@@ -511,12 +542,14 @@ contract SuperpositionHook is IHooks, Ownable {
     function _settleOwed(PoolKey memory key, int256 need0, int256 need1) internal {
         if (need0 < 0) {
             poolManager.sync(key.currency0);
-            IERC20(Currency.unwrap(key.currency0)).safeTransfer(address(poolManager), uint256(-need0));
+            IERC20(Currency.unwrap(key.currency0))
+                .safeTransfer(address(poolManager), uint256(-need0));
             poolManager.settle();
         }
         if (need1 < 0) {
             poolManager.sync(key.currency1);
-            IERC20(Currency.unwrap(key.currency1)).safeTransfer(address(poolManager), uint256(-need1));
+            IERC20(Currency.unwrap(key.currency1))
+                .safeTransfer(address(poolManager), uint256(-need1));
             poolManager.settle();
         }
     }

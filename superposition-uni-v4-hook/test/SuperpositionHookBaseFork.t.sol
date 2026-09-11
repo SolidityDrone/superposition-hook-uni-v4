@@ -17,7 +17,7 @@ import {SuperpositionHook} from "../src/SuperpositionHook.sol";
 import {LiquidityAmounts} from "../src/libraries/LiquidityAmounts.sol";
 import {IAggregatorV3} from "../src/interfaces/IAggregatorV3.sol";
 import {IAavePool} from "../src/interfaces/IAavePool.sol";
-import {HookMiner} from "./utils/HookMiner.sol";
+import {HookMiner} from "../src/libraries/HookMiner.sol";
 import {TestSwapRouter} from "./helpers/TestSwapRouter.sol";
 
 contract SuperpositionHookBaseForkTest is Test {
@@ -27,8 +27,10 @@ contract SuperpositionHookBaseForkTest is Test {
     address internal constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address internal constant AWETH = 0xD4a0e0b9149BCee3C920d2E00b5dE09138fd8bb7;
     address internal constant AUSDC = 0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB;
-    IAggregatorV3 internal constant ETH_USD = IAggregatorV3(0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70);
-    IAggregatorV3 internal constant USDC_USD = IAggregatorV3(0x7e860098F58bBFC8648a4311b374B1D669a2bc6B);
+    IAggregatorV3 internal constant ETH_USD =
+        IAggregatorV3(0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70);
+    IAggregatorV3 internal constant USDC_USD =
+        IAggregatorV3(0x7e860098F58bBFC8648a4311b374B1D669a2bc6B);
 
     SuperpositionHook internal hook;
     uint160 internal sqrtPriceX96;
@@ -40,13 +42,16 @@ contract SuperpositionHookBaseForkTest is Test {
         vm.createSelectFork("base");
 
         uint160 flags = uint160(
-            Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG
-                | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
+                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
-        bytes memory args = abi.encode(PM, AAVE, WETH, USDC, AWETH, AUSDC, ETH_USD, USDC_USD);
+        bytes memory args =
+            abi.encode(PM, AAVE, WETH, USDC, AWETH, AUSDC, ETH_USD, USDC_USD, address(this));
         (address predicted, bytes32 salt) =
             HookMiner.find(address(this), flags, type(SuperpositionHook).creationCode, args);
-        hook = new SuperpositionHook{salt: salt}(PM, AAVE, WETH, USDC, AWETH, AUSDC, ETH_USD, USDC_USD);
+        hook = new SuperpositionHook{salt: salt}(
+            PM, AAVE, WETH, USDC, AWETH, AUSDC, ETH_USD, USDC_USD, address(this)
+        );
         assertEq(address(hook), predicted);
 
         sqrtPriceX96 = _sqrtPriceFromFeeds();
@@ -67,7 +72,8 @@ contract SuperpositionHookBaseForkTest is Test {
         // raw price token1/token0 = (ethPrice/1e8 * 1e6) / (usdcPrice/1e8 * 1e18)
         //                        = ethPrice / (usdcPrice * 1e12)
         // sqrtPriceX96 = sqrt(price * 2^192)
-        uint256 priceX192 = Math.mulDiv(uint256(ethPrice), uint256(1) << 192, uint256(usdcPrice) * 1e12);
+        uint256 priceX192 =
+            Math.mulDiv(uint256(ethPrice), uint256(1) << 192, uint256(usdcPrice) * 1e12);
         return uint160(Math.sqrt(priceX192));
     }
 
@@ -111,7 +117,10 @@ contract SuperpositionHookBaseForkTest is Test {
             amount1Desired
         );
         (uint256 exp0, uint256 exp1) = LiquidityAmounts.getAmountsForLiquidity(
-            sqrtPriceX96, TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), liq
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(lower),
+            TickMath.getSqrtPriceAtTick(upper),
+            liq
         );
 
         vm.prank(lp);
@@ -156,7 +165,10 @@ contract SuperpositionHookBaseForkTest is Test {
             amount1Desired
         );
         (exp0, exp1) = LiquidityAmounts.getAmountsForLiquidity(
-            sqrtPriceX96, TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), liq
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(lower),
+            TickMath.getSqrtPriceAtTick(upper),
+            liq
         );
         vm.prank(lp);
         shares = hook.deposit(
@@ -355,8 +367,9 @@ contract SuperpositionHookBaseForkTest is Test {
 
     function test_non_manager_hook_calls_revert() public {
         PoolKey memory key = _poolKey();
-        IPoolManager.ModifyLiquidityParams memory params =
-            IPoolManager.ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 0, salt: 0});
+        IPoolManager.ModifyLiquidityParams memory params = IPoolManager.ModifyLiquidityParams({
+            tickLower: -600, tickUpper: 600, liquidityDelta: 0, salt: 0
+        });
 
         vm.expectRevert(SuperpositionHook.NotPoolManager.selector);
         hook.beforeAddLiquidity(address(0xBAD), key, params, "");
@@ -448,7 +461,9 @@ contract DirectLpAttacker {
         PoolKey memory key = abi.decode(data, (PoolKey));
         manager.modifyLiquidity(
             key,
-            IPoolManager.ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 1e15, salt: 0}),
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 1e15, salt: 0
+            }),
             ""
         );
         return "";
