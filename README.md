@@ -138,17 +138,17 @@ sequenceDiagram
     participant H as SuperpositionHook
     participant PM as PoolManager
     participant A as Aave v3
-    U->>H: deposit(range, amount0Desired, amount1Desired, ...)
+    U->>H: deposit(range, amount0Desired, amount1Desired)
     H->>H: syncYield()
     H->>PM: getSlot0 (current sqrtPrice)
-    H->>H: liquidity = LiquidityAmounts(...); required = SqrtPriceMath round-up
-    H->>U: pull required + buffer (one side may be zero)
-    H->>H: bucket.c += pulled; liquidity += L; mint shares at pool price
-    H->>A: supply(WETH), supply(USDC) — try/catch
+    H->>H: liquidity and round-up required amounts
+    H->>U: pull required plus buffer (one side may be zero)
+    H->>H: bucket.c += pulled, liquidity += L, mint shares at pool price
+    H->>A: supply(WETH) and supply(USDC) in try/catch
     U->>H: withdraw(range, shares)
-    H->>H: syncYield(); f = shares / bucket.shares
-    H->>A: withdraw(f * (c0, c1)) (clamped to real liquidity)
-    H->>U: WETH / USDC (principal + yield)
+    H->>H: syncYield(), f = shares / bucket.shares
+    H->>A: withdraw f times (c0, c1), clamped to real liquidity
+    H->>U: WETH and USDC (principal plus yield)
 ```
 
 ---
