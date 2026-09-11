@@ -147,7 +147,11 @@ contract BaseSepoliaForkTest is Test {
         vm.prank(lp);
         (uint256 wOut, uint256 uOut) = hook.withdraw(
             SuperpositionHook.WithdrawParams({
-                tickLower: base - 600, tickUpper: base + 600, shareAmount: shares, recipient: lp
+                tickLower: base - 600,
+                tickUpper: base + 600,
+                owner: lp,
+                shareAmount: shares,
+                recipient: lp
             })
         );
 

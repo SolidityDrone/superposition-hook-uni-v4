@@ -22,6 +22,7 @@ import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {IAavePool} from "./interfaces/IAavePool.sol";
+import {BucketShares} from "./BucketShares.sol";
 
 /// @title SuperpositionHook
 /// @notice A Uniswap v4 concentrated-liquidity hook that keeps 100% of pooled capital earning
@@ -64,6 +65,8 @@ contract SuperpositionHook is IHooks, Ownable {
     error InsufficientShares();
     /// @notice Thrown when referencing a range that has never been deposited into.
     error NoBucket();
+    /// @notice Thrown when the caller is neither the share owner nor an approved operator.
+    error NotAuthorized();
 
     /// @dev Extra wei pulled per token to absorb Aave's per-supply index rounding (see deposit).
     uint256 internal constant DEPOSIT_BUFFER = 1000;
@@ -111,11 +114,13 @@ contract SuperpositionHook is IHooks, Ownable {
     /// @notice Arguments for `withdraw`.
     /// @param tickLower Lower tick bound of the bucket.
     /// @param tickUpper Upper tick bound of the bucket.
+    /// @param owner Holder whose bucket shares are burned.
     /// @param shareAmount Bucket shares to burn.
     /// @param recipient Receiver of the underlying.
     struct WithdrawParams {
         int24 tickLower;
         int24 tickUpper;
+        address owner;
         uint256 shareAmount;
         address recipient;
     }
@@ -136,6 +141,8 @@ contract SuperpositionHook is IHooks, Ownable {
     IERC20 public immutable aWeth;
     /// @notice Aave interest-bearing USDC, held by the vault.
     IERC20 public immutable aUsdc;
+    /// @notice ERC-1155 share token; one id per bucket.
+    BucketShares public immutable shareToken;
 
     // ---------------------------------------------------------------------
     // Storage
@@ -154,8 +161,6 @@ contract SuperpositionHook is IHooks, Ownable {
     Bucket[] internal buckets;
     /// @dev keccak(lower, upper) => 1-based index into `buckets` (0 means "not present").
     mapping(bytes32 => uint256) internal bucketIndex;
-    /// @dev keccak(lower, upper) => owner => bucket shares.
-    mapping(bytes32 => mapping(address => uint256)) internal bucketShares;
     /// @dev Per bucket JIT add delta captured in `beforeSwap` and applied in `afterSwap`.
     mapping(bytes32 => int256) internal jitAdd0;
     mapping(bytes32 => int256) internal jitAdd1;
@@ -239,6 +244,9 @@ contract SuperpositionHook is IHooks, Ownable {
         usdc = IERC20(_usdc);
         aWeth = IERC20(_aWeth);
         aUsdc = IERC20(_aUsdc);
+
+        // The hook owns the share token so it is the only minter/burner.
+        shareToken = new BucketShares("", address(this));
 
         poolKey = PoolKey({
             currency0: Currency.wrap(_weth),
@@ -337,7 +345,7 @@ contract SuperpositionHook is IHooks, Ownable {
         }
         if (sharesMinted == 0) revert ZeroShares();
 
-        bucketShares[key][p.recipient] += sharesMinted;
+        shareToken.mint(p.recipient, uint256(key), sharesMinted);
         totalC0 += pull0;
         totalC1 += pull1;
 
@@ -364,7 +372,12 @@ contract SuperpositionHook is IHooks, Ownable {
         bytes32 key = _bucketKey(p.tickLower, p.tickUpper);
         uint256 idx = bucketIndex[key];
         if (idx == 0) revert NoBucket();
-        if (bucketShares[key][msg.sender] < p.shareAmount) revert InsufficientShares();
+        if (msg.sender != p.owner && !shareToken.isApprovedForAll(p.owner, msg.sender)) {
+            revert NotAuthorized();
+        }
+        if (shareToken.balanceOf(p.owner, uint256(key)) < p.shareAmount) {
+            revert InsufficientShares();
+        }
 
         _syncYield();
 
@@ -378,7 +391,7 @@ contract SuperpositionHook is IHooks, Ownable {
         b.c1 -= usdcOut;
         b.liquidity -= dl;
         b.shares = total - p.shareAmount;
-        bucketShares[key][msg.sender] -= p.shareAmount;
+        shareToken.burn(p.owner, uint256(key), p.shareAmount);
         totalC0 -= wethOut;
         totalC1 -= usdcOut;
         if (b.liquidity == 0) b.active = false;
@@ -389,7 +402,7 @@ contract SuperpositionHook is IHooks, Ownable {
         usdcOut = _payout(usdc, aUsdc, usdcOut, p.recipient);
 
         emit Withdrawn(
-            msg.sender, p.recipient, p.tickLower, p.tickUpper, p.shareAmount, wethOut, usdcOut
+            p.owner, p.recipient, p.tickLower, p.tickUpper, p.shareAmount, wethOut, usdcOut
         );
     }
 
@@ -444,7 +457,7 @@ contract SuperpositionHook is IHooks, Ownable {
     /// @param upper Upper tick bound.
     /// @return The user's bucket shares.
     function sharesOf(address user, int24 lower, int24 upper) external view returns (uint256) {
-        return bucketShares[_bucketKey(lower, upper)][user];
+        return shareToken.balanceOf(user, uint256(_bucketKey(lower, upper)));
     }
 
     /// @notice Total shares of the bucket `(lower, upper)`.

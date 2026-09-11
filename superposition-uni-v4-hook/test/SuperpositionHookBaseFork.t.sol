@@ -16,6 +16,7 @@ import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 import {SuperpositionHook} from "../src/SuperpositionHook.sol";
+import {BucketShares} from "../src/BucketShares.sol";
 import {IAggregatorV3} from "../src/interfaces/IAggregatorV3.sol";
 import {IAavePool} from "../src/interfaces/IAavePool.sol";
 import {HookMiner} from "../src/libraries/HookMiner.sol";
@@ -194,7 +195,11 @@ contract SuperpositionHookBaseForkTest is Test {
     {
         int24 base = _floor(currentTick, 10);
         return SuperpositionHook.WithdrawParams({
-            tickLower: base - 600, tickUpper: base + 600, shareAmount: shares, recipient: lp
+            tickLower: base - 600,
+            tickUpper: base + 600,
+            owner: lp,
+            shareAmount: shares,
+            recipient: lp
         });
     }
 
@@ -413,7 +418,7 @@ contract SuperpositionHookBaseForkTest is Test {
         vm.prank(lp2);
         hook.withdraw(
             SuperpositionHook.WithdrawParams({
-                tickLower: lower, tickUpper: upper, shareAmount: s2, recipient: lp2
+                tickLower: lower, tickUpper: upper, owner: lp2, shareAmount: s2, recipient: lp2
             })
         );
 
@@ -422,6 +427,33 @@ contract SuperpositionHookBaseForkTest is Test {
         assertApproxEqAbs(c1, 0, 10);
         SuperpositionHook.Bucket[] memory bs2 = hook.getBuckets();
         assertFalse(bs2[0].active);
+    }
+
+    function test_fork_delegate_withdraw() public {
+        (uint256 shares,,,,,) = _depositDefault(1e18, 3000e6);
+        int24 base = _floor(currentTick, 10);
+        address delegate = address(0xDE1E6A7E);
+
+        // The owner approves a delegate contract as an ERC-1155 operator.
+        BucketShares token = hook.shareToken();
+        vm.prank(lp);
+        token.setApprovalForAll(delegate, true);
+
+        uint256 wBefore = IERC20(WETH).balanceOf(delegate);
+        vm.prank(delegate);
+        (uint256 wOut, uint256 uOut) = hook.withdraw(
+            SuperpositionHook.WithdrawParams({
+                tickLower: base - 600,
+                tickUpper: base + 600,
+                owner: lp,
+                shareAmount: shares / 2,
+                recipient: delegate
+            })
+        );
+
+        assertGt(wOut + uOut, 0);
+        assertEq(IERC20(WETH).balanceOf(delegate) - wBefore, wOut);
+        assertEq(hook.sharesOf(lp, base - 600, base + 600), shares - shares / 2);
     }
 
     function test_non_manager_hook_calls_revert() public {

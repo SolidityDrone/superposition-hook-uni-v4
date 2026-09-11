@@ -8,7 +8,7 @@
   <img alt="Foundry" src="https://img.shields.io/badge/Built%20with-Foundry-ffb300" />
   <img alt="Testnet" src="https://img.shields.io/badge/Testnet-Base%20Sepolia%2084532-0052ff" />
   <img alt="Mainnet" src="https://img.shields.io/badge/Also%20fork%20tested-Base%20mainnet-0052ff" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-21%20passing-brightgreen" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-22%20passing-brightgreen" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue" />
 </p>
 
@@ -23,6 +23,8 @@ yield is attributed per token to the bucket that held it — **no external oracl
 - **Idle capital? Zero.** Every token is a yield-bearing `aToken` between swaps.
 - **Normal v4 surface.** Ticks, price impact and fees behave exactly like a standard v4 CL pool.
 - **One-sided in, one-sided out.** A USDC bid below spot stays USDC (or becomes WETH once filled).
+- **Transferable shares.** Ownership is an ERC-1155 token (one id per range), so a position can be
+  transferred or delegated to an approved operator that withdraws capital + yield.
 - **Fair yield.** Atomic join → exit returns exactly the principal; yield accrues only to shares that
   were present, and swap PnL + fees land on the range that produced them.
 
@@ -168,7 +170,10 @@ struct Bucket {
 ```
 
 Within a bucket shares are fungible (several LPs in the same range share it); across buckets they
-are independent. This is what makes a one-sided, out-of-range order able to exit one-sided.
+are independent. Shares are the **`BucketShares` ERC-1155 token**, one id per range
+(`uint256(keccak256(abi.encodePacked(lower, upper)))`); they are transferable and support
+`setApprovalForAll`, so a delegate contract can withdraw on the owner's behalf. This is what makes a
+one-sided, out-of-range order able to exit one-sided.
 
 ### 5.1 Minting at the pool price (no external oracle)
 
@@ -313,6 +318,7 @@ classDiagram
         +initializePool(uint160)
         +deposit(DepositParams) uint256
         +withdraw(WithdrawParams) (uint256,uint256)
+        +shareToken() BucketShares
         +syncYield()
         +currentBalance() (uint256,uint256)
         +virtualBalance() (uint256,uint256)
@@ -321,12 +327,18 @@ classDiagram
         +sharesOf(address,int24,int24) uint256
         +getBuckets() Bucket[]
     }
+    class BucketShares {
+        <<ERC-1155>>
+        +mint(address,uint256,uint256)
+        +burn(address,uint256,uint256)
+    }
     class HookMiner {
         <<library>>
     }
     IHooks <|.. SuperpositionHook
     Ownable <|-- SuperpositionHook
     SuperpositionHook ..> HookMiner
+    SuperpositionHook --> BucketShares : mints / burns
 ```
 
 ```mermaid
@@ -371,8 +383,9 @@ Reverts: `JitActive`, `PoolNotInitialized`, `InvalidRange`, `NoLiquidity`, `Slip
 ### `withdraw(WithdrawParams) → (uint256 wethOut, uint256 usdcOut)`
 
 `syncYield`, then burns `shareAmount / bucket.shares` of the bucket's `(c0, c1)` and reduces its
-liquidity; pays from Aave + idle, clamped to real liquidity. Reverts: `JitActive`, `ZeroShares`,
-`InsufficientShares`, `NoBucket`.
+liquidity; pays from Aave + idle, clamped to real liquidity. The `owner` field is whose ERC-1155
+shares are burned, callable by the owner or an ERC-1155 operator (`setApprovalForAll`). Reverts:
+`JitActive`, `ZeroShares`, `InsufficientShares`, `NoBucket`, `NotAuthorized`.
 
 ### `syncYield()`
 
@@ -454,6 +467,7 @@ no mocks except a forced Aave failure.
 | `test_fork_partial_aave_supply_stays_correct` | mixed real + virtual after a failed supply |
 | `test_fork_withdraw_after_swap` | withdraw works after a swap |
 | `test_fork_multi_lp_full_exit` | two LPs fully drain a bucket |
+| `test_fork_delegate_withdraw` | an ERC-1155 operator withdraws capital + yield for the owner |
 | `test_non_manager_hook_calls_revert` / `test_direct_lp_modify_reverts` | access control |
 
 **Base Sepolia testnet suite** (the deployment target)
@@ -517,6 +531,7 @@ forge test
 ```
 src/
   SuperpositionHook.sol        hook + vault (buckets, JIT, Aave, yield)
+  BucketShares.sol             ERC-1155 share token, one id per range
   libraries/
     HookMiner.sol              CREATE2 salt search for v4 permission bits
   interfaces/
