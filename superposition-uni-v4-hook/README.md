@@ -8,7 +8,7 @@
   <img alt="Foundry" src="https://img.shields.io/badge/Built%20with-Foundry-ffb300" />
   <img alt="Testnet" src="https://img.shields.io/badge/Testnet-Base%20Sepolia%2084532-0052ff" />
   <img alt="Mainnet" src="https://img.shields.io/badge/Also%20fork%20tested-Base%20mainnet-0052ff" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-23%20passing-brightgreen" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-24%20passing-brightgreen" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue" />
 </p>
 
@@ -255,7 +255,7 @@ The hook accepts **any ERC-4626 vault pair**. It reads only `vault.asset()`, `va
 **Aave wrappers.** Aave v3 ships ERC-4626 wrappers ("Wrapped Aave" / `stataToken`) that hold the
 aToken and grow in value. Pre-deployed wrappers exist on 18 networks, including Ethereum, Base,
 Arbitrum, Optimism, Polygon, Avalanche, Gnosis, Scroll, Linea, Celo, Sonic, Monad and their
-testnets; for any other listed asset the permissionless `STATA_FACTORY.getStaticAToken(asset)` can
+testnets; for any other listed asset the permissionless `StataTokenFactory.createStataTokens([asset])` can
 mint one. The core aToken (rebasing balance) is intentionally **not** accepted, which is exactly
 what keeps every side on the same, uniform ERC-4626 model across chains.
 
@@ -440,7 +440,7 @@ event Withdrawn(address indexed owner, address indexed recipient, int24 lower, i
 
 ## 14. Testing
 
-`forge test` — **23 tests passing** across two forks with **real contracts** (Uniswap v4 + real
+`forge test` — **24 tests passing** across two forks with **real contracts** (Uniswap v4 + real
 ERC-4626 vaults), no mocks except forced vault failures.
 
 - `BaseSepoliaForkTest` — **the deployment target**, using Aave's real ERC-4626 wrappers.
@@ -456,6 +456,7 @@ ERC-4626 vaults), no mocks except forced vault failures.
 | `test_fork_deposit_survives_vault_failure` | try/catch fallback with idle tokens |
 | `test_fork_partial_vault_deposit_stays_correct` | mixed real + virtual after a failed deposit |
 | `test_fork_mixed_vaults_aave_morpho` | one Aave side, one Morpho side, same hook |
+| `test_fork_factory_creates_vault_for_unwrapped_asset` | create a wrapper via `StataTokenFactory` for an asset without one (tBTC) and use it |
 | `test_fork_multi_lp_full_exit`, `test_fork_delegate_withdraw` | lifecycle + ERC-1155 operator |
 | `test_non_manager_hook_calls_revert`, `test_direct_lp_modify_reverts` | access control |
 

@@ -22,6 +22,13 @@ import {IAggregatorV3} from "../src/interfaces/IAggregatorV3.sol";
 import {HookMiner} from "../src/libraries/HookMiner.sol";
 import {TestSwapRouter} from "./helpers/TestSwapRouter.sol";
 
+/// @notice Aave StataTokenFactory: creates ERC-4626 wrappers for listed-but-unwrapped assets.
+interface IStataTokenFactory {
+    function getStataToken(address underlying) external view returns (address);
+
+    function createStataTokens(address[] memory underlyings) external returns (address[] memory);
+}
+
 /// @notice Base mainnet fork suite (reference market). Any ERC-4626 vault pair works; here the
 ///         sides are Aave's ERC-4626 wrappers, and one test mixes Aave with a Morpho vault.
 contract SuperpositionHookBaseForkTest is Test {
@@ -447,6 +454,64 @@ contract SuperpositionHookBaseForkTest is Test {
         assertGt(wOut + uOut, 0);
         assertEq(IERC20(WETH).balanceOf(operator) - wBefore, wOut);
         assertEq(hook.sharesOf(lp, base - 600, base + 600), shares - shares / 2);
+    }
+
+    /// @notice An asset listed on Aave but without a pre-deployed wrapper: create it via the
+    ///         StataTokenFactory, then use it as a lending vault in the same hook.
+    function test_fork_factory_creates_vault_for_unwrapped_asset() public {
+        address TBTC = 0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b;
+        IStataTokenFactory factory = IStataTokenFactory(0x78d33BF0014ab169725F2Ea5a62b200F2977faeE);
+
+        // No wrapper exists yet for tBTC; create one permissionlessly.
+        assertEq(factory.getStataToken(TBTC), address(0));
+        address[] memory underlyings = new address[](1);
+        underlyings[0] = TBTC;
+        address tbtcVault = factory.createStataTokens(underlyings)[0];
+        assertEq(IERC4626(tbtcVault).asset(), TBTC);
+
+        // tBTC (0x236a…) < USDC (0x8335…) -> the tBTC vault is currency0.
+        SuperpositionHook tbtcHook = _deployHook(IERC4626(tbtcVault), VAULT_USDC);
+        uint160 sqrtP = _tbtcUsdcPrice();
+        tbtcHook.initializePool(sqrtP);
+
+        deal(TBTC, lp, 10e18);
+        int24 tick = TickMath.getTickAtSqrtPrice(sqrtP);
+        int24 lower = _floor(tick, 10) - 600;
+        int24 upper = _floor(tick, 10) + 600;
+
+        vm.startPrank(lp);
+        IERC20(TBTC).approve(address(tbtcHook), type(uint256).max);
+        IERC20(USDC).approve(address(tbtcHook), type(uint256).max);
+        uint256 shares = tbtcHook.deposit(
+            SuperpositionHook.DepositParams({
+                tickLower: lower,
+                tickUpper: upper,
+                amount0Desired: 1e18,
+                amount1Desired: 100_000e6,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: lp
+            })
+        );
+        vm.stopPrank();
+
+        assertGt(shares, 0);
+        assertGt(IERC4626(tbtcVault).balanceOf(address(tbtcHook)), 0);
+        assertGt(VAULT_USDC.balanceOf(address(tbtcHook)), 0);
+
+        vm.prank(lp);
+        (uint256 a0, uint256 a1) = tbtcHook.withdraw(
+            SuperpositionHook.WithdrawParams({
+                tickLower: lower, tickUpper: upper, owner: lp, shareAmount: shares, recipient: lp
+            })
+        );
+        assertGt(a0 + a1, 0);
+    }
+
+    function _tbtcUsdcPrice() internal pure returns (uint160) {
+        // Fixed assumption for the test: 1 tBTC = 100_000 USDC (tBTC 18 decimals, USDC 6).
+        uint256 priceX192 = Math.mulDiv(100_000 * 1e8, uint256(1) << 192, uint256(1e8) * 1e12);
+        return uint160(Math.sqrt(priceX192));
     }
 
     /// @notice Same hook, one Aave-backed side and one Morpho-backed side.
