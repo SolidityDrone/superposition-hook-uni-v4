@@ -3,3 +3,4 @@ cache/
 broadcast/
 .env
 node_modules/
+docs/
