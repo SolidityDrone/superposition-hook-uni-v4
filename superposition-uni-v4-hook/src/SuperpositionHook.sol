@@ -20,7 +20,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 
-import {LiquidityAmounts} from "./libraries/LiquidityAmounts.sol";
+import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {ShareMath} from "./libraries/ShareMath.sol";
 import {IAavePool} from "./interfaces/IAavePool.sol";
 import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
@@ -256,7 +256,7 @@ contract SuperpositionHook is IHooks, Ownable {
         for (uint256 i = 0; i < len; i++) {
             Range memory r = ranges[i];
             if (!r.active || r.liquidity == 0) continue;
-            (uint256 a0, uint256 a1) = LiquidityAmounts.getAmountsForLiquidity(
+            (uint256 a0, uint256 a1) = _requiredAmounts(
                 sqrtP,
                 TickMath.getSqrtPriceAtTick(r.lower),
                 TickMath.getSqrtPriceAtTick(r.upper),

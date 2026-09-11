@@ -14,7 +14,8 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 
 import {SuperpositionHook} from "../src/SuperpositionHook.sol";
-import {LiquidityAmounts} from "../src/libraries/LiquidityAmounts.sol";
+import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {IAggregatorV3} from "../src/interfaces/IAggregatorV3.sol";
 import {IAavePool} from "../src/interfaces/IAavePool.sol";
 import {HookMiner} from "../src/libraries/HookMiner.sol";
@@ -102,6 +103,24 @@ contract SuperpositionHookBaseForkTest is Test {
         });
     }
 
+    function _required(uint128 liquidity, int24 lower, int24 upper)
+        internal
+        view
+        returns (uint256 amount0, uint256 amount1)
+    {
+        uint160 sqrtP = sqrtPriceX96;
+        uint160 sqrtLower = TickMath.getSqrtPriceAtTick(lower);
+        uint160 sqrtUpper = TickMath.getSqrtPriceAtTick(upper);
+        if (sqrtP <= sqrtLower) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtLower, sqrtUpper, liquidity, true);
+        } else if (sqrtP < sqrtUpper) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtP, sqrtUpper, liquidity, true);
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtLower, sqrtP, liquidity, true);
+        } else {
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtLower, sqrtUpper, liquidity, true);
+        }
+    }
+
     function test_fork_deposit_two_sided() public {
         int24 base = _floor(currentTick, 10);
         int24 lower = base - 600;
@@ -116,12 +135,7 @@ contract SuperpositionHookBaseForkTest is Test {
             amount0Desired,
             amount1Desired
         );
-        (uint256 exp0, uint256 exp1) = LiquidityAmounts.getAmountsForLiquidity(
-            sqrtPriceX96,
-            TickMath.getSqrtPriceAtTick(lower),
-            TickMath.getSqrtPriceAtTick(upper),
-            liq
-        );
+        (uint256 exp0, uint256 exp1) = _required(liq, lower, upper);
 
         vm.prank(lp);
         uint256 shares = hook.deposit(
@@ -164,12 +178,7 @@ contract SuperpositionHookBaseForkTest is Test {
             amount0Desired,
             amount1Desired
         );
-        (exp0, exp1) = LiquidityAmounts.getAmountsForLiquidity(
-            sqrtPriceX96,
-            TickMath.getSqrtPriceAtTick(lower),
-            TickMath.getSqrtPriceAtTick(upper),
-            liq
-        );
+        (exp0, exp1) = _required(liq, lower, upper);
         vm.prank(lp);
         shares = hook.deposit(
             SuperpositionHook.DepositParams({

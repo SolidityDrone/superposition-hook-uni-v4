@@ -35,7 +35,6 @@ transaction, its supply rate and utilization are unaffected.
 | File | Purpose |
 |---|---|
 | `src/SuperpositionHook.sol` | The hook and vault: deposits, withdrawals, JIT liquidity, share accounting |
-| `src/libraries/LiquidityAmounts.sol` | Range liquidity ⇄ token amount math |
 | `src/libraries/ShareMath.sol` | ERC-4626 style share conversion with virtual offsets |
 | `src/libraries/HookMiner.sol` | CREATE2 salt search for the v4 permission bits |
 | `src/interfaces/IAavePool.sol` | Aave v3 pool subset |
@@ -60,6 +59,16 @@ aToken balance is the underlying amount and yield needs no extra accounting.
 - `virtualBalance()` — the per-range composition at the current price
 - `totalAssets()`, `sharePrice()`, `convertToShares()`, `convertToAssets()`
 - `balanceOf(address)`, `totalSupply()`, `getRanges()`
+
+## Stack
+
+- `Uniswap/v4-core` **v4.0.0** (latest release)
+- `Uniswap/v4-periphery` (`LiquidityAmounts`, `HookMiner` reference)
+- `OpenZeppelin/openzeppelin-contracts` v5.1.0
+- `foundry-rs/forge-std`
+
+Hooks are deployed to a CREATE2 address whose low 14 bits encode the v4 callbacks
+(`Hooks.isValidHookAddress` enforces this on `initialize`).
 
 ## Build and test
 
