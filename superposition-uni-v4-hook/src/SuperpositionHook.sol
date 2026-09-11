@@ -15,6 +15,7 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 
 import {LiquidityAmounts} from "./libraries/LiquidityAmounts.sol";
 import {ShareMath} from "./libraries/ShareMath.sol";
@@ -43,6 +44,7 @@ contract SuperpositionHook is IHooks, Ownable {
 
     uint256 internal constant WAD = 1e18;
     uint256 internal constant FEED_SCALE = 1e8;
+    uint256 internal constant DEPOSIT_BUFFER = 5;
 
     struct Range {
         int24 lower;
@@ -161,24 +163,30 @@ contract SuperpositionHook is IHooks, Ownable {
         );
         if (liquidity == 0) revert NoLiquidity();
 
-        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(sqrtP, sqrtLower, sqrtUpper, liquidity);
+        (uint256 amount0, uint256 amount1) = _requiredAmounts(sqrtP, sqrtLower, sqrtUpper, liquidity);
         if (amount0 < p.amount0Min || amount1 < p.amount1Min) revert Slippage();
+
+        // Aave's liquidity index rounds balances down by a few wei; keep a tiny buffer so the
+        // vault can always re-materialize the exact range the PoolManager asks for.
+        uint256 pull0 = amount0 == 0 ? 0 : amount0 + DEPOSIT_BUFFER;
+        uint256 pull1 = amount1 == 0 ? 0 : amount1 + DEPOSIT_BUFFER;
+        if (pull0 > p.amount0Desired || pull1 > p.amount1Desired) revert Slippage();
 
         uint256 preTotal = totalAssets();
 
-        if (amount0 > 0) weth.safeTransferFrom(msg.sender, address(this), amount0);
-        if (amount1 > 0) usdc.safeTransferFrom(msg.sender, address(this), amount1);
+        if (pull0 > 0) weth.safeTransferFrom(msg.sender, address(this), pull0);
+        if (pull1 > 0) usdc.safeTransferFrom(msg.sender, address(this), pull1);
 
         _addRange(p.tickLower, p.tickUpper, liquidity);
-        _supply(weth, amount0);
-        _supply(usdc, amount1);
+        _supply(weth, pull0);
+        _supply(usdc, pull1);
 
-        uint256 value = _value(amount0, amount1);
+        uint256 value = _value(pull0, pull1);
         sharesMinted = ShareMath.toShares(value, preTotal, totalShares);
         if (sharesMinted == 0) revert ZeroShares();
         _mint(p.recipient, sharesMinted);
 
-        emit Deposited(p.recipient, p.tickLower, p.tickUpper, liquidity, amount0, amount1, sharesMinted);
+        emit Deposited(p.recipient, p.tickLower, p.tickUpper, liquidity, pull0, pull1, sharesMinted);
     }
 
     /// @notice Burn shares and receive a pro-rata slice of the vault's real holdings.
@@ -320,19 +328,71 @@ contract SuperpositionHook is IHooks, Ownable {
         return (IHooks.afterRemoveLiquidity.selector, BalanceDelta.wrap(0));
     }
 
-    function beforeSwap(address, PoolKey calldata, IPoolManager.SwapParams calldata, bytes calldata)
+    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, bytes calldata)
         external
-        pure
+        onlyPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
+        if (_activeLiquidity() == 0) revert NoLiquidity();
+
+        jitActive = true;
+        _withdrawAllFromAave();
+
+        int256 need0;
+        int256 need1;
+        uint256 len = ranges.length;
+        for (uint256 i = 0; i < len; i++) {
+            Range memory r = ranges[i];
+            if (!r.active || r.liquidity == 0) continue;
+            (BalanceDelta delta,) = poolManager.modifyLiquidity(
+                key,
+                IPoolManager.ModifyLiquidityParams({
+                    tickLower: r.lower,
+                    tickUpper: r.upper,
+                    liquidityDelta: int256(uint256(r.liquidity)),
+                    salt: bytes32(0)
+                }),
+                ""
+            );
+            need0 += int256(delta.amount0());
+            need1 += int256(delta.amount1());
+        }
+        _settleOwed(key, need0, need1);
+
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function afterSwap(address, PoolKey calldata, IPoolManager.SwapParams calldata, BalanceDelta, bytes calldata)
+    function afterSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, BalanceDelta, bytes calldata)
         external
-        pure
+        onlyPoolManager
         returns (bytes4, int128)
     {
+        int256 take0;
+        int256 take1;
+        uint256 len = ranges.length;
+        for (uint256 i = 0; i < len; i++) {
+            Range memory r = ranges[i];
+            if (!r.active || r.liquidity == 0) continue;
+            (BalanceDelta delta,) = poolManager.modifyLiquidity(
+                key,
+                IPoolManager.ModifyLiquidityParams({
+                    tickLower: r.lower,
+                    tickUpper: r.upper,
+                    liquidityDelta: -int256(uint256(r.liquidity)),
+                    salt: bytes32(0)
+                }),
+                ""
+            );
+            take0 += int256(delta.amount0());
+            take1 += int256(delta.amount1());
+        }
+        if (take0 > 0) poolManager.take(key.currency0, address(this), uint256(take0));
+        if (take1 > 0) poolManager.take(key.currency1, address(this), uint256(take1));
+
+        _supply(weth, weth.balanceOf(address(this)));
+        _supply(usdc, usdc.balanceOf(address(this)));
+
+        jitActive = false;
         return (IHooks.afterSwap.selector, 0);
     }
 
@@ -361,6 +421,22 @@ contract SuperpositionHook is IHooks, Ownable {
         (, int256 answer,, uint256 updatedAt,) = feed.latestRoundData();
         if (answer <= 0 || updatedAt == 0) revert StalePrice();
         return uint256(answer);
+    }
+
+    /// @dev Token amounts a range needs at `sqrtP`, rounded UP exactly like the PoolManager does.
+    function _requiredAmounts(uint160 sqrtP, uint160 sqrtLower, uint160 sqrtUpper, uint128 liquidity)
+        internal
+        pure
+        returns (uint256 amount0, uint256 amount1)
+    {
+        if (sqrtP <= sqrtLower) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtLower, sqrtUpper, liquidity, true);
+        } else if (sqrtP < sqrtUpper) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtP, sqrtUpper, liquidity, true);
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtLower, sqrtP, liquidity, true);
+        } else {
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtLower, sqrtUpper, liquidity, true);
+        }
     }
 
     function _mint(address to, uint256 amount) internal {
@@ -409,6 +485,35 @@ contract SuperpositionHook is IHooks, Ownable {
             } else {
                 r.liquidity -= dec;
             }
+        }
+    }
+
+    function _activeLiquidity() internal view returns (uint256 total) {
+        uint256 len = ranges.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (ranges[i].active) total += ranges[i].liquidity;
+        }
+    }
+
+    /// @dev JIT: pull the entire yield position back into underlying so it can back the swap.
+    function _withdrawAllFromAave() internal {
+        uint256 aW = aWeth.balanceOf(address(this));
+        uint256 aU = aUsdc.balanceOf(address(this));
+        if (aW > 0) IAavePool(aavePool).withdraw(address(weth), aW, address(this));
+        if (aU > 0) IAavePool(aavePool).withdraw(address(usdc), aU, address(this));
+    }
+
+    /// @dev Pays the PoolManager whatever the just-added liquidity owes it.
+    function _settleOwed(PoolKey memory key, int256 need0, int256 need1) internal {
+        if (need0 < 0) {
+            poolManager.sync(key.currency0);
+            IERC20(Currency.unwrap(key.currency0)).safeTransfer(address(poolManager), uint256(-need0));
+            poolManager.settle();
+        }
+        if (need1 < 0) {
+            poolManager.sync(key.currency1);
+            IERC20(Currency.unwrap(key.currency1)).safeTransfer(address(poolManager), uint256(-need1));
+            poolManager.settle();
         }
     }
 }

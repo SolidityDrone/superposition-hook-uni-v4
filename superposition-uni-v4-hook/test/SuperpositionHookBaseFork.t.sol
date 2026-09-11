@@ -6,13 +6,18 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 
 import {SuperpositionHook} from "../src/SuperpositionHook.sol";
 import {LiquidityAmounts} from "../src/libraries/LiquidityAmounts.sol";
 import {IAggregatorV3} from "../src/interfaces/IAggregatorV3.sol";
 import {HookMiner} from "./utils/HookMiner.sol";
+import {TestSwapRouter} from "./helpers/TestSwapRouter.sol";
 
 contract SuperpositionHookBaseForkTest is Test {
     IPoolManager internal constant PM = IPoolManager(0x498581fF718922c3f8e6A244956aF099B2652b2b);
@@ -80,6 +85,16 @@ contract SuperpositionHookBaseForkTest is Test {
         return compressed * spacing;
     }
 
+    function _poolKey() internal view returns (PoolKey memory) {
+        return PoolKey({
+            currency0: Currency.wrap(WETH),
+            currency1: Currency.wrap(USDC),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: IHooks(address(hook))
+        });
+    }
+
     function test_fork_deposit_two_sided() public {
         int24 base = _floor(currentTick, 10);
         int24 lower = base - 600;
@@ -116,8 +131,8 @@ contract SuperpositionHookBaseForkTest is Test {
         assertEq(hook.getRanges().length, 1);
 
         (uint256 w, uint256 u) = hook.currentBalance();
-        assertApproxEqAbs(w, exp0, 1);
-        assertApproxEqAbs(u, exp1, 1);
+        assertApproxEqAbs(w, exp0, 10);
+        assertApproxEqAbs(u, exp1, 10);
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
         assertEq(IERC20(USDC).balanceOf(address(hook)), 0);
         assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
@@ -166,11 +181,11 @@ contract SuperpositionHookBaseForkTest is Test {
 
         assertEq(IERC20(WETH).balanceOf(lp) - wBefore, wOut);
         assertEq(IERC20(USDC).balanceOf(lp) - uBefore, uOut);
-        assertApproxEqAbs(wOut, exp0, 2);
-        assertApproxEqAbs(uOut, exp1, 2);
+        assertApproxEqAbs(wOut, exp0, 10);
+        assertApproxEqAbs(uOut, exp1, 10);
         assertEq(hook.balanceOf(lp), 0);
         assertEq(hook.totalSupply(), 0);
-        assertApproxEqAbs(hook.totalAssets(), 0, 2);
+        assertApproxEqAbs(hook.totalAssets(), 0, 10);
     }
 
     function test_fork_withdraw_half() public {
@@ -180,10 +195,37 @@ contract SuperpositionHookBaseForkTest is Test {
         vm.prank(lp);
         (uint256 wOut, uint256 uOut) = hook.withdraw(half, lp);
 
-        assertApproxEqAbs(wOut, exp0 / 2, 2);
-        assertApproxEqAbs(uOut, exp1 / 2, 2);
+        assertApproxEqAbs(wOut, exp0 / 2, 10);
+        assertApproxEqAbs(uOut, exp1 / 2, 10);
         assertEq(hook.balanceOf(lp), shares - half);
         SuperpositionHook.Range[] memory rs = hook.getRanges();
         assertApproxEqAbs(uint256(rs[0].liquidity), uint256(liq) / 2, uint256(liq) / 1000);
+    }
+
+    function test_fork_swap_jit_cycle() public {
+        _depositDefault(1e18, 3000e6);
+        TestSwapRouter router = new TestSwapRouter(PM);
+
+        vm.startPrank(lp);
+        IERC20(WETH).approve(address(router), type(uint256).max);
+        IERC20(USDC).approve(address(router), type(uint256).max);
+        vm.stopPrank();
+
+        (uint160 sqrtBefore, int24 tickBefore,,) = StateLibrary.getSlot0(PM, hook.poolId());
+        uint256 wethBefore = IERC20(WETH).balanceOf(lp);
+
+        vm.prank(lp);
+        router.swap(_poolKey(), true, -0.01e18, TickMath.MIN_SQRT_PRICE + 1, lp);
+
+        (uint160 sqrtAfter, int24 tickAfter,,) = StateLibrary.getSlot0(PM, hook.poolId());
+        assertLt(sqrtAfter, sqrtBefore);
+        assertLt(tickAfter, tickBefore);
+        assertLt(IERC20(WETH).balanceOf(lp), wethBefore);
+
+        assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
+        assertEq(IERC20(USDC).balanceOf(address(hook)), 0);
+        assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
+        assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
+        assertFalse(hook.jitActive());
     }
 }
