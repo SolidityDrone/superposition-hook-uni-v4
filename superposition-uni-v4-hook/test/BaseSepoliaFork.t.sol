@@ -4,6 +4,7 @@ pragma solidity 0.8.30;
 import {Test} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
@@ -19,14 +20,16 @@ import {HookMiner} from "../src/libraries/HookMiner.sol";
 import {TestSwapRouter} from "./helpers/TestSwapRouter.sol";
 
 /// @notice Base Sepolia (chain id 84532) fork suite — the testnet deployment target.
-/// @dev Aave's Base Sepolia USDC is its own test market asset (`0xba50…`), not Circle USDC.
+/// @dev Uses Aave's real ERC-4626 wrappers on Base Sepolia, so no mocks.
 contract BaseSepoliaForkTest is Test {
     IPoolManager internal constant PM = IPoolManager(0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408);
-    address internal constant AAVE = 0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27;
+
     address internal constant WETH = 0x4200000000000000000000000000000000000006;
-    address internal constant USDC = 0xba50Cd2A20f6DA35D788639E581bca8d0B5d4D5f;
-    address internal constant AWETH = 0x73a5bB60b0B0fc35710DDc0ea9c407031E31Bdbb;
-    address internal constant AUSDC = 0x10F1A9D11CDf50041f3f8cB7191CBE2f31750ACC;
+    address internal constant USDC = 0xba50Cd2A20f6DA35D788639E581bca8d0B5d4D5f; // Aave's test USDC
+
+    IERC4626 internal constant VAULT_WETH = IERC4626(0xde7820fFb73059608928cb9e29F6EB1369Ad1342);
+    IERC4626 internal constant VAULT_USDC = IERC4626(0xf430cb6E2b85f99222fBFA6dFEa18Ff60FA6B32a);
+
     IAggregatorV3 internal constant ETH_USD =
         IAggregatorV3(0x4aDC67696bA383F43DD60A9e78F2C97Fbbfc7cb1);
     IAggregatorV3 internal constant USDC_USD =
@@ -46,12 +49,10 @@ contract BaseSepoliaForkTest is Test {
                 | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         bytes memory args =
-            abi.encode(PM, AAVE, WETH, USDC, AWETH, AUSDC, uint24(500), int24(10), address(this));
+            abi.encode(PM, VAULT_WETH, VAULT_USDC, uint24(500), int24(10), address(this));
         (address predicted, bytes32 salt) =
             HookMiner.find(address(this), flags, type(SuperpositionHook).creationCode, args);
-        hook = new SuperpositionHook{salt: salt}(
-            PM, AAVE, WETH, USDC, AWETH, AUSDC, 500, 10, address(this)
-        );
+        hook = new SuperpositionHook{salt: salt}(PM, VAULT_WETH, VAULT_USDC, 500, 10, address(this));
         assertEq(address(hook), predicted);
 
         sqrtPriceX96 = _sqrtPriceFromFeeds();
@@ -114,8 +115,8 @@ contract BaseSepoliaForkTest is Test {
 
         assertGt(shares, 0);
         assertEq(hook.sharesOf(lp, base - 600, base + 600), shares);
-        assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
-        assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
+        assertGt(VAULT_WETH.balanceOf(address(hook)), 0);
+        assertGt(VAULT_USDC.balanceOf(address(hook)), 0);
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
         (uint256 c0, uint256 c1) = hook.totalClaim();
         assertGt(c0 + c1, 0);
@@ -136,7 +137,7 @@ contract BaseSepoliaForkTest is Test {
 
         assertLt(sqrtAfter, sqrtBefore);
         assertFalse(hook.jitActive());
-        assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
+        assertGt(VAULT_WETH.balanceOf(address(hook)), 0);
     }
 
     function test_sepolia_withdraw() public {
@@ -169,8 +170,8 @@ contract BaseSepoliaForkTest is Test {
 
         assertGt(shares, 0);
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
-        assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
-        (uint256 vw,) = hook.virtualBalance();
-        assertEq(vw, 0);
+        assertGt(VAULT_USDC.balanceOf(address(hook)), 0);
+        (uint256 v0,) = hook.virtualBalance();
+        assertEq(v0, 0);
     }
 }

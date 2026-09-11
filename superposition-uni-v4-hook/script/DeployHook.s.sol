@@ -5,6 +5,7 @@ import {Script, console2} from "forge-std/Script.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
 import {SuperpositionHook} from "../src/SuperpositionHook.sol";
 import {HookMiner} from "../src/libraries/HookMiner.sol";
@@ -54,11 +55,8 @@ contract DeployHook is Script {
     function _constructorArgs(address owner) internal pure returns (bytes memory) {
         return abi.encode(
             IPoolManager(BaseSepoliaAddresses.POOL_MANAGER),
-            BaseSepoliaAddresses.AAVE_POOL,
-            BaseSepoliaAddresses.WETH,
-            BaseSepoliaAddresses.USDC,
-            BaseSepoliaAddresses.AWETH,
-            BaseSepoliaAddresses.AUSDC,
+            IERC4626(BaseSepoliaAddresses.VAULT0),
+            IERC4626(BaseSepoliaAddresses.VAULT1),
             BaseSepoliaAddresses.FEE,
             BaseSepoliaAddresses.TICK_SPACING,
             owner

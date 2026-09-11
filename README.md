@@ -8,25 +8,30 @@
   <img alt="Foundry" src="https://img.shields.io/badge/Built%20with-Foundry-ffb300" />
   <img alt="Testnet" src="https://img.shields.io/badge/Testnet-Base%20Sepolia%2084532-0052ff" />
   <img alt="Mainnet" src="https://img.shields.io/badge/Also%20fork%20tested-Base%20mainnet-0052ff" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-22%20passing-brightgreen" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-23%20passing-brightgreen" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue" />
 </p>
 
 > **Deployment target: Base Sepolia (chain id 84532) — TESTNET.** Also fork-tested on Base mainnet.
 
-A Uniswap v4 concentrated-liquidity hook whose capital sits **100% in Aave v3** between swaps.
-Liquidity is *virtual*: real v4 positions are materialized for the duration of a swap transaction,
-then unwound and re-supplied to Aave. Ownership is tracked **per tick range** (a "bucket"), so an
-out-of-range, one-sided deposit is a real **limit order** and can be withdrawn one-sided. Aave
-yield is attributed per token to the bucket that held it — **no external oracle** is used.
+A Uniswap v4 concentrated-liquidity hook whose capital sits **100% in two external ERC-4626
+lending vaults** (one per side) between swaps. The hook is **protocol-agnostic**: it only talks
+ERC-4626, so either side can be a Morpho MetaMorpho vault, an Euler v2 EVault, a Spark Savings
+vault, a Yearn vault, or an Aave ERC-4626 wrapper — in any combination. The pool's two currencies
+are read from `vault.asset()`, so **any token pair** works, not just a specific one.
 
-- **Idle capital? Zero.** Every token is a yield-bearing `aToken` between swaps.
+Liquidity is *virtual*: real v4 positions are materialized for the duration of a swap transaction,
+then unwound and re-deposited into the vaults. Ownership is tracked **per tick range** (a
+"bucket"), so an out-of-range, one-sided deposit is a real **limit order** and can be withdrawn
+one-sided. Yield is attributed per token to the bucket that held it. No external oracle is used.
+
+- **Idle capital? Zero.** Every token earns the vault's yield between swaps.
 - **Normal v4 surface.** Ticks, price impact and fees behave exactly like a standard v4 CL pool.
-- **One-sided in, one-sided out.** A USDC bid below spot stays USDC (or becomes WETH once filled).
-- **Transferable shares.** Ownership is an ERC-1155 token (one id per range), so a position can be
-  transferred or delegated to an approved operator that withdraws capital + yield.
-- **Fair yield.** Atomic join → exit returns exactly the principal; yield accrues only to shares that
-  were present, and swap PnL + fees land on the range that produced them.
+- **One-sided in, one-sided out.** A token1 bid below spot stays token1 (or becomes token0 once filled).
+- **Transferable shares.** Ownership is an ERC-1155 token (one id per range), transferable and
+  delegate-able: an approved operator can withdraw capital + yield.
+- **Fair yield.** Atomic join → exit returns exactly the principal; swap PnL + fees land on the
+  range that produced them.
 
 ---
 
@@ -38,9 +43,9 @@ yield is attributed per token to the bucket that held it — **no external oracl
 4. [Lifecycle: deposit & withdraw](#4-lifecycle-deposit--withdraw)
 5. [Per-range buckets, shares and yield](#5-per-range-buckets-shares-and-yield)
 6. [Limit orders](#6-limit-orders)
-7. [Failure handling: mixed real + virtual](#7-failure-handling-mixed-real--virtual)
+7. [Lending backends](#7-lending-backends)
 8. [Uniswap v4 integration](#8-uniswap-v4-integration)
-9. [Aave integration](#9-aave-integration)
+9. [Failure handling: mixed real + virtual](#9-failure-handling-mixed-real--virtual)
 10. [Contracts (UML)](#10-contracts-uml)
 11. [API reference](#11-api-reference)
 12. [Invariants](#12-invariants)
@@ -58,10 +63,10 @@ In a normal v4 pool, LP tokens sit in the `PoolManager` and earn nothing while i
 pool's view and the location of the capital are separated:
 
 - The **pool's `liquidity`** (what the AMM prices against) is reconstructed around each swap.
-- The **capital** lives in Aave as `aWETH`/`aUSDC`, accruing yield the whole time.
+- The **capital** lives in the two ERC-4626 vaults, accruing their yield the whole time.
 
-The only moment tokens are not in Aave is the duration of a single swap transaction, so Aave's
-utilization (and rate) is effectively unaffected by the hook.
+The only moment tokens are not in the vaults is the duration of a single swap transaction, so the
+vaults' utilization (and rate) is effectively unaffected by the hook.
 
 ---
 
@@ -70,12 +75,13 @@ utilization (and rate) is effectively unaffected by the hook.
 ```mermaid
 flowchart LR
     LP["Liquidity providers"] -->|"deposit(range, amounts)"| H["SuperpositionHook"]
-    H -->|"mint bucket shares"| LP
+    H -->|"mint bucket shares (ERC-1155)"| LP
     LP -->|"withdraw(range, shares)"| H
 
-    H -->|"supply / withdraw"| AAVE["Aave v3 Pool"]
-    AAVE --> AT["aWETH / aUSDC (yield-bearing)"]
-    AT -.->|"balanceOf grows"| H
+    H -->|"deposit / redeem (ERC-4626)"| V0["vault0 (currency0)"]
+    H -->|"deposit / redeem (ERC-4626)"| V1["vault1 (currency1)"]
+    V0 -.->|"convertToAssets grows"| H
+    V1 -.->|"convertToAssets grows"| H
 
     SW["Swappers"] -->|"swap()"| R["Router / Universal Router"]
     R -->|"unlock()"| PM["Uniswap v4 PoolManager"]
@@ -86,14 +92,14 @@ flowchart LR
 | Layer | Responsibility |
 |---|---|
 | `PoolManager` | v4 CL math, tick state, deltas, settlement |
-| `SuperpositionHook` | vault, per-range buckets/shares, JIT lifecycle, Aave custody |
-| Aave v3 | yield on 100% of idle capital |
+| `SuperpositionHook` | vault, per-range buckets/shares, JIT lifecycle, ERC-4626 custody |
+| `vault0` / `vault1` | lending yield on 100% of idle capital (any ERC-4626) |
 
 ---
 
 ## 3. Lifecycle: swap (JIT)
 
-Between swaps the pool holds **zero real liquidity** — everything is in Aave. `beforeSwap`
+Between swaps the pool holds **zero real liquidity** — everything is in the vaults. `beforeSwap`
 materializes every bucket; `afterSwap` reverses it and attributes PnL.
 
 ```mermaid
@@ -102,11 +108,11 @@ sequenceDiagram
     participant U as Swapper
     participant PM as PoolManager
     participant H as SuperpositionHook
-    participant A as Aave v3
+    participant V as ERC-4626 vaults
     U->>PM: swap(key, params) (via router unlock)
     PM->>H: beforeSwap()
     Note over H: jitActive = true
-    H->>A: withdraw(all aWETH + aUSDC)
+    H->>V: redeem all shares to underlying
     H->>H: syncYield() (distribute yield per token)
     loop each active bucket
         H->>PM: modifyLiquidity(+L)  (store add delta)
@@ -119,13 +125,14 @@ sequenceDiagram
         H->>H: bucket.c += removeDelta + addDelta
     end
     H->>PM: take(proceeds + fees)
-    H->>A: supply(all WETH + USDC) — try/catch
+    H->>V: deposit(all) — try/catch
     Note over H: jitActive = false
 ```
 
 **Why this settles cleanly.** Removing a bucket credits the hook a positive delta which `take`
-zeroes *before* the Aave supply leg runs. The supply is `try/catch`-wrapped, so even if it reverts,
-every `PoolManager` delta is already zero and `nonZeroDeltaCount == 0` when the lock closes.
+zeroes *before* the vault deposit leg runs. The deposit is `try/catch`-wrapped, so even if it
+reverts, every `PoolManager` delta is already zero and `nonzeroDeltaCount == 0` when the lock
+closes.
 
 ---
 
@@ -137,18 +144,18 @@ sequenceDiagram
     participant U as LP
     participant H as SuperpositionHook
     participant PM as PoolManager
-    participant A as Aave v3
+    participant V as ERC-4626 vaults
     U->>H: deposit(range, amount0Desired, amount1Desired)
     H->>H: syncYield()
     H->>PM: getSlot0 (current sqrtPrice)
     H->>H: liquidity and round-up required amounts
     H->>U: pull required plus buffer (one side may be zero)
     H->>H: bucket.c += pulled, liquidity += L, mint shares at pool price
-    H->>A: supply(WETH) and supply(USDC) in try/catch
-    U->>H: withdraw(range, shares)
+    H->>V: deposit token0 and token1 in try/catch
+    U->>H: withdraw(range, shares, owner)
     H->>H: syncYield(), f = shares / bucket.shares
-    H->>A: withdraw f times (c0, c1), clamped to real liquidity
-    H->>U: WETH and USDC (principal plus yield)
+    H->>V: withdraw f times (c0, c1), clamped to real position
+    H->>U: token0 / token1 (principal plus yield)
 ```
 
 ---
@@ -159,18 +166,18 @@ Each distinct `(tickLower, tickUpper)` is a **bucket**:
 
 ```solidity
 struct Bucket {
-    int24  lower;
-    int24  upper;
+    int24   lower;
+    int24   upper;
     uint128 liquidity;   // total v4 CL liquidity in this range
     uint256 shares;      // total internal shares of this bucket
-    uint256 c0;          // WETH claim (underlying, incl. yield)
-    uint256 c1;          // USDC claim (underlying, incl. yield)
+    uint256 c0;          // token0 claim (underlying, incl. yield)
+    uint256 c1;          // token1 claim (underlying, incl. yield)
     bool    active;
 }
 ```
 
-Within a bucket shares are fungible (several LPs in the same range share it); across buckets they
-are independent. Shares are the **`BucketShares` ERC-1155 token**, one id per range
+Within a bucket shares are fungible; across buckets they are independent. Shares are the
+**`BucketShares` ERC-1155 token**, one id per range
 (`uint256(keccak256(abi.encodePacked(lower, upper)))`); they are transferable and support
 `setApprovalForAll`, so a delegate contract can withdraw on the owner's behalf. This is what makes a
 one-sided, out-of-range order able to exit one-sided.
@@ -185,33 +192,16 @@ sharesMinted = value(pulled0, pulled1) * bucket.shares / value(bucket.c0, bucket
 
 Because the deposit is priced with the same AMM price as the bucket, an atomic deposit → withdraw
 returns exactly the principal, and existing yield is not diluted. One-sided buckets need no price
-at all. Aave's `balanceOf` is index-accrued, so `c` grows with yield.
+at all.
 
 ### 5.2 Yield, per token and uniform
 
-`_syncYield()` distributes `R - Σc` for each token pro-rata to each bucket's claim:
+`_syncYield()` distributes `R - Σc` for each token pro-rata to each bucket's claim, where
+`R = vault.convertToAssets(vault.balanceOf(hook)) + idle`. So an in-range two-sided LP earns both
+tokens in proportion to its composition; a one-tick token1 order earns the token1 yield while it
+rests and the token0 yield on the token it acquires after a fill; an atomic entrant earns nothing.
 
-```
-yield0 = R0 - totalC0 ;  bucket.c0 += yield0 * bucket.c0 / totalC0
-yield1 = R1 - totalC1 ;  bucket.c1 += yield1 * bucket.c1 / totalC1
-```
-
-So an in-range two-sided LP earns both tokens in proportion to its composition; a one-tick USDC
-order earns the USDC yield while it rests and the WETH yield on the token it acquires after a fill;
-an atomic entrant earns nothing.
-
-### 5.3 Worked example
-
-| Step | bucket c | bucket shares | Bob | Alice |
-|---|---|---|---|---|
-| Bob deposits 1 WETH + 2,500 USDC | 1 WETH / 2,500 USDC | 3,500 | 3,500 | — |
-| Yield: +0.01 WETH, +25 USDC | 1.01 WETH / 2,525 USDC | 3,500 | 3,500 | — |
-| Alice deposits at the new price | 1.02 WETH / 2,550 USDC | 3,536 | 3,500 | 36 |
-| Alice exits immediately | 1.01 WETH / 2,525 USDC | 3,500 | 3,500 | 0 |
-
-Alice receives ≈ her principal; the yield stays with Bob.
-
-### 5.4 Swap PnL per bucket
+### 5.3 Swap PnL per bucket
 
 `beforeSwap` stores each bucket's add delta; `afterSwap` applies the removal delta:
 
@@ -225,39 +215,52 @@ so `Σ c == R` after every cycle, and a range that was filled is the only one th
 
 ## 6. Limit orders
 
-A range fully below spot needs only USDC; a range fully above spot needs only WETH. Because the
-deposit pulls exactly the range-required amounts, a one-sided, out-of-range deposit is a real limit
-order, and a 1-tick-wide range is the most capital-efficient form of it.
+A range fully below spot needs only token1; a range fully above spot needs only token0. Because
+the deposit pulls exactly the range-required amounts, a one-sided, out-of-range deposit is a real
+limit order, and a 1-tick-wide range is the most capital-efficient form of it. The pool's
+`tickSpacing` sets the narrowest range (use `tickSpacing = 1` for a true 1-tick order).
 
 ```solidity
-// USDC-only bid just below spot
+// token1-only bid just below spot (WETH/USDC used here only as an example pair)
 hook.deposit(DepositParams({
     tickLower: lower,
     tickUpper: upper,          // upper < currentTick
-    amount0Desired: 0,         // no WETH
-    amount1Desired: 3_000e6,   // USDC only
+    amount0Desired: 0,         // no token0
+    amount1Desired: someUsdc,  // token1 only
     amount0Min: 0, amount1Min: 0,
     recipient: alice
 }));
 ```
 
-When a swap pushes the price into the range, the bucket sells USDC and acquires WETH; a withdrawal
-then pays WETH. There is no order object — the range is the order. Note the pool's `tickSpacing`
-sets the narrowest range (use `tickSpacing = 1` for a true 1-tick order; it is a constructor
-parameter). The deposit pulls `required + DEPOSIT_BUFFER` (1000 wei) to absorb Aave's per-supply
-index rounding.
+When a swap pushes the price into the range, the bucket sells token1 and acquires token0; a
+withdrawal then pays token0. There is no order object — the range is the order.
+
+The deposit pulls `required + DEPOSIT_BUFFER` (1000 wei) to absorb ERC-4626 share/asset rounding.
 
 ---
 
-## 7. Failure handling: mixed real + virtual
+## 7. Lending backends
 
-Aave can reject a supply (cap, frozen reserve, paused market). `afterSwap` settles all v4 deltas
-before the supply leg, so a caught failure leaves idle ERC-20 in the hook — never an unsettled
-delta. `totalClaim()` and `currentBalance()` count both aTokens and idle, and the next swap funds
-the buckets from idle **plus** withdrawn aTokens. The pool therefore behaves as though real and
-virtual are one, because at swap time they are.
+The hook accepts **any ERC-4626 vault pair**. It reads only `vault.asset()`, `vault.balanceOf()`,
+`convertToAssets()`, and calls `deposit` / `withdraw` / `redeem`. There is no protocol branch.
 
-Aave's `supply` is all-or-nothing, so a cap hit parks the amount idle until capacity returns.
+| Backend | ERC-4626 | Notes |
+|---|---|---|
+| **Morpho** (MetaMorpho V1 / Vault V2) | yes | `maxWithdraw` may return 0 on V2, so the hook clamps to `convertToAssets(balanceOf)` |
+| **Euler v2** (EVault) | yes | ERC-4626 vault with borrowing via EVC; supply-only use here |
+| **Spark Savings** (`spUSDC`, `spUSDT`, …) | yes | `withdraw`/`redeem` can revert on insufficient idle liquidity |
+| **Yearn v3** / other vaults | yes | any standard vault |
+| **Aave v3** | wrapper only | the core aToken is **not** ERC-4626; use the official wrapper (`waToken` / BGD `stataToken`) |
+
+**Aave wrappers.** Aave v3 ships ERC-4626 wrappers ("Wrapped Aave" / `stataToken`) that hold the
+aToken and grow in value. Pre-deployed wrappers exist on 18 networks, including Ethereum, Base,
+Arbitrum, Optimism, Polygon, Avalanche, Gnosis, Scroll, Linea, Celo, Sonic, Monad and their
+testnets; for any other listed asset the permissionless `STATA_FACTORY.getStaticAToken(asset)` can
+mint one. The core aToken (rebasing balance) is intentionally **not** accepted, which is exactly
+what keeps every side on the same, uniform ERC-4626 model across chains.
+
+If a chain/asset has **no** ERC-4626 vault (Aave wrapper, Morpho, Euler, Spark, …), that token is
+not usable with the hook there — a coverage limit, not a behavioural one.
 
 ---
 
@@ -268,7 +271,7 @@ Aave's `supply` is all-or-nothing, so a cap hit parks the amount idle until capa
 | `beforeAddLiquidity` | `1 << 11` | reject anyone but the hook from LPing the pool |
 | `beforeRemoveLiquidity` | `1 << 9` | same |
 | `beforeSwap` | `1 << 7` | JIT materialize buckets, sync yield, settle |
-| `afterSwap` | `1 << 6` | JIT remove buckets, attribute PnL/fees, re-supply |
+| `afterSwap` | `1 << 6` | JIT remove buckets, attribute PnL/fees, re-deposit |
 
 v4 decides which callbacks to invoke from the **low 14 bits of the hook address**, and
 `PoolManager.initialize` reverts `HookAddressNotValid` unless they match. `HookMiner` mirrors
@@ -283,14 +286,16 @@ withdrawals revert while `jitActive`.
 
 ---
 
-## 9. Aave integration
+## 9. Failure handling: mixed real + virtual
 
-- `supply` and `withdraw` only; the hook **never borrows**.
-- On Aave v3.2 `aToken.balanceOf` is index-accrued, so it is the underlying amount and grows with
-  yield; `_syncYield` distributes that growth per token.
-- Every `supply` is `try/catch`-wrapped; on failure the approval is reset and tokens stay idle.
-- Sources of a few-wei drift (Aave index rounding) are absorbed by `DEPOSIT_BUFFER` and by clamping
-  withdrawals to real liquidity.
+A vault can reject a deposit (cap, paused market) or a withdrawal (illiquidity). `afterSwap`
+settles all v4 deltas before the deposit leg, so a caught failure leaves idle ERC-20 in the hook —
+never an unsettled delta. `currentBalance()` counts both vault positions and idle, and the next
+swap funds the buckets from idle **plus** redeemed underlying. The pool behaves as though real and
+virtual are one, because at swap time they are.
+
+ERC-4626 `deposit` mints shares rounded down and `withdraw` rounds assets up; the `DEPOSIT_BUFFER`
+and the withdrawal clamp handle those few wei.
 
 ---
 
@@ -308,17 +313,16 @@ classDiagram
     class Ownable
     class SuperpositionHook {
         +IPoolManager poolManager
-        +address aavePool
-        +IERC20 weth
-        +IERC20 usdc
-        +PoolKey poolKey
+        +IERC4626 vault0
+        +IERC4626 vault1
+        +IERC20 token0
+        +IERC20 token1
         +bool jitActive
         +uint256 totalC0
         +uint256 totalC1
         +initializePool(uint160)
         +deposit(DepositParams) uint256
         +withdraw(WithdrawParams) (uint256,uint256)
-        +shareToken() BucketShares
         +syncYield()
         +currentBalance() (uint256,uint256)
         +virtualBalance() (uint256,uint256)
@@ -341,64 +345,53 @@ classDiagram
     SuperpositionHook --> BucketShares : mints / burns
 ```
 
-```mermaid
-classDiagram
-    class Bucket {
-        +int24 lower
-        +int24 upper
-        +uint128 liquidity
-        +uint256 shares
-        +uint256 c0
-        +uint256 c1
-        +bool active
-    }
-    class DepositParams {
-        +int24 tickLower
-        +int24 tickUpper
-        +uint256 amount0Desired
-        +uint256 amount1Desired
-        +uint256 amount0Min
-        +uint256 amount1Min
-        +address recipient
-    }
-    class WithdrawParams {
-        +int24 tickLower
-        +int24 tickUpper
-        +uint256 shareAmount
-        +address recipient
-    }
-```
-
 ---
 
 ## 11. API reference
 
+### Constructor
+
+```solidity
+constructor(
+    IPoolManager poolManager,
+    IERC4626 vault0,        // asset() must be < asset() of vault1
+    IERC4626 vault1,
+    uint24 fee,
+    int24 tickSpacing,
+    address initialOwner
+)
+```
+
+The pool currencies are `token0 = vault0.asset()` and `token1 = vault1.asset()`; they must be
+sorted ascending (v4 requires `currency0 < currency1`). No token addresses are passed explicitly,
+so the same contract serves any pair and any ERC-4626 backend.
+
 ### `deposit(DepositParams) → uint256 sharesMinted`
 
-Computes range liquidity, pulls exactly the required WETH/USDC (+ buffer), updates the bucket
-(`c`, `liquidity`, `shares`) and supplies to Aave (try/catch). Mints shares at the pool price.
+Computes range liquidity, pulls exactly the required tokens (+ buffer), updates the bucket
+(`c`, `liquidity`, `shares`) and deposits into the vaults (try/catch). Mints shares at the pool price.
 
 Reverts: `JitActive`, `PoolNotInitialized`, `InvalidRange`, `NoLiquidity`, `Slippage`, `ZeroShares`.
 
-### `withdraw(WithdrawParams) → (uint256 wethOut, uint256 usdcOut)`
+### `withdraw(WithdrawParams) → (uint256 amount0, uint256 amount1)`
 
 `syncYield`, then burns `shareAmount / bucket.shares` of the bucket's `(c0, c1)` and reduces its
-liquidity; pays from Aave + idle, clamped to real liquidity. The `owner` field is whose ERC-1155
-shares are burned, callable by the owner or an ERC-1155 operator (`setApprovalForAll`). Reverts:
-`JitActive`, `ZeroShares`, `InsufficientShares`, `NoBucket`, `NotAuthorized`.
+liquidity; pays from the vaults + idle, clamped to the real position. The `owner` field is whose
+ERC-1155 shares are burned, callable by the owner or an ERC-1155 operator. Reverts: `JitActive`,
+`ZeroShares`, `InsufficientShares`, `NoBucket`, `NotAuthorized`.
 
 ### `syncYield()`
 
-Realizes accrued Aave yield into the buckets. Idempotent; safe to call anytime off the JIT window.
+Realizes accrued vault yield into the buckets. Idempotent; safe off the JIT window.
 
 ### Views
 
 | Function | Returns |
 |---|---|
-| `currentBalance()` | real `(WETH, USDC)` = aTokens + idle |
+| `currentBalance()` | real `(token0, token1)` = vault positions + idle |
 | `virtualBalance()` | bucket composition at the current price |
 | `totalClaim()` | `(Σc0, Σc1)` |
-| `bucketValue(lower, upper)` | bucket claim value in USDC terms |
+| `bucketValue(lower, upper)` | bucket claim value in token1 terms |
 | `sharesOf(user, lower, upper)` / `totalSharesOf(lower, upper)` | bucket share accounting |
 | `getBuckets()` | array of `Bucket` |
 
@@ -415,18 +408,18 @@ event Withdrawn(address indexed owner, address indexed recipient, int24 lower, i
 
 `NotPoolManager`, `HookNotImplemented`, `OnlyHook`, `JitActive`, `NoLiquidity`, `Slippage`,
 `InvalidRange`, `PoolNotInitialized`, `AlreadyInitialized`, `ZeroShares`, `InsufficientShares`,
-`NoBucket`.
+`NoBucket`, `NotAuthorized`.
 
 ---
 
 ## 12. Invariants
 
-- `Σ bucket.c0 == totalC0 - dust`, `Σ bucket.c1 == totalC1 - dust`; `totalC ≤ R` per token.
+- `totalC ≤ R` per token, where `R = vault position + idle`.
 - `bucket.shares` is conserved by yield and swaps (only deposits/withdrawals change it), so value
   per share grows with yield.
 - Swap PnL and fees land only on the bucket that was crossed.
 - All hook `PoolManager` deltas are zero when the lock closes.
-- No external oracle: valuation uses only the v4 pool price, and one-sided buckets need none.
+- No external oracle: valuation uses only the v4 pool price; one-sided buckets need none.
 
 ---
 
@@ -436,53 +429,41 @@ event Withdrawn(address indexed owner, address indexed recipient, int24 lower, i
 |---|---|
 | Yield theft by atomic join/exit | shares minted at the pool price; `c` does not move within a tx |
 | Cross-range PnL leak | per-bucket add/remove deltas from the PoolManager |
-| Empty-vault edge | first deposit mints 1:1; value-based mint thereafter |
 | Re-entrancy during JIT | `jitActive` guard on `deposit` / `withdraw` / `syncYield` |
 | Unauthorized LPing | `beforeAddLiquidity` / `beforeRemoveLiquidity` require `sender == hook` |
 | Hook callback spoofing | every callback is `onlyPoolManager` |
-| Aave supply failure | `try/catch`; tokens stay idle and counted |
-| Aave index rounding | `DEPOSIT_BUFFER` + withdrawal clamped to real liquidity |
+| Vault deposit failure | `try/catch`; tokens stay idle and counted |
+| Vault rounding | `DEPOSIT_BUFFER` + withdrawal clamped to the real position |
 | Insolvency via accounting drift | cached totals only grow; payouts clamped to holdings |
 
 ---
 
 ## 14. Testing
 
-`forge test` — **21 tests passing** across two forks with real contracts (Uniswap v4, Aave v3),
-no mocks except a forced Aave failure.
+`forge test` — **23 tests passing** across two forks with **real contracts** (Uniswap v4 + real
+ERC-4626 vaults), no mocks except forced vault failures.
 
-- `BaseSepoliaForkTest` — **the deployment target: Base Sepolia (chain id 84532, TESTNET)**
-- `SuperpositionHookBaseForkTest` — Base mainnet fork (reference, deeper market)
+- `BaseSepoliaForkTest` — **the deployment target**, using Aave's real ERC-4626 wrappers.
+- `SuperpositionHookBaseForkTest` — Base mainnet, including a **mixed** pool (`waWETH` + Morpho USDC).
 
 | Test | Proves |
 |---|---|
-| `test_initial_views` | clean initial state |
-| `test_fork_deposit_two_sided` | bucket liquidity, aToken custody, zero idle |
+| `test_fork_deposit_two_sided` | bucket liquidity, vault custody, zero idle |
 | `test_fork_withdraw_returns_principal` / `_half` | one-sided-correct pro-rata exit |
-| `test_fork_swap_jit_cycle` | full JIT swap, price move, capital back in Aave |
-| `test_fork_one_sided_usdc_limit_order` | USDC-only out-of-range deposit |
-| `test_fork_limit_order_fills_on_cross` | the limit order fills when price crosses |
+| `test_fork_swap_jit_cycle` | full JIT swap, price move, capital back in the vaults |
+| `test_fork_one_sided_usdc_limit_order` / `..._fills_on_cross` | one-sided limit orders |
 | `test_fork_yield_accrual_and_atomic_exit_fairness` | atomic join/exit earns no yield |
-| `test_fork_deposit_survives_aave_failure` | try/catch fallback with idle tokens |
-| `test_fork_partial_aave_supply_stays_correct` | mixed real + virtual after a failed supply |
-| `test_fork_withdraw_after_swap` | withdraw works after a swap |
-| `test_fork_multi_lp_full_exit` | two LPs fully drain a bucket |
-| `test_fork_delegate_withdraw` | an ERC-1155 operator withdraws capital + yield for the owner |
-| `test_non_manager_hook_calls_revert` / `test_direct_lp_modify_reverts` | access control |
-
-**Base Sepolia testnet suite** (the deployment target)
-
-`test_sepolia_deploy_and_deposit`, `test_sepolia_jit_swap`, `test_sepolia_withdraw`,
-`test_sepolia_usdc_only_limit_order`.
-
-Plus `LiquidityAmounts.t.sol` for the canonical periphery math.
+| `test_fork_deposit_survives_vault_failure` | try/catch fallback with idle tokens |
+| `test_fork_partial_vault_deposit_stays_correct` | mixed real + virtual after a failed deposit |
+| `test_fork_mixed_vaults_aave_morpho` | one Aave side, one Morpho side, same hook |
+| `test_fork_multi_lp_full_exit`, `test_fork_delegate_withdraw` | lifecycle + ERC-1155 operator |
+| `test_non_manager_hook_calls_revert`, `test_direct_lp_modify_reverts` | access control |
 
 ---
 
 ## 15. Deployment
 
 > **TESTNET.** Target is **Base Sepolia (chain id 84532)**; the script reverts on any other chain.
-> On Base Sepolia the vault uses **Aave's USDC test asset** (`0xba50Cd2A…d4D5f`), not Circle USDC.
 
 ```bash
 forge script script/DeployHook.s.sol --rpc-url base_sepolia --broadcast --private-key <KEY>
@@ -490,30 +471,25 @@ forge script script/DeployHook.s.sol --rpc-url base_sepolia --broadcast --privat
 
 **Base Sepolia (84532, TESTNET) addresses**
 
-| Contract | Address |
+| Item | Address |
 |---|---|
 | v4 `PoolManager` | `0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408` |
-| Aave v3 `Pool` | `0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27` |
-| WETH / aWETH | `0x4200…0006` / `0x73a5bB60b0B0fc35710DDc0ea9c407031E31Bdbb` |
-| USDC (Aave test) / aUSDC | `0xba50Cd2A20f6DA35D788639E581bca8d0B5d4D5f` / `0x10F1A9D11CDf50041f3f8cB7191CBE2f31750ACC` |
-| Chainlink ETH/USD (price only) | `0x4aDC67696bA383F43DD60A9e78F2C97Fbbfc7cb1` |
-| Chainlink USDC/USD (price only) | `0xd30e2101a97dcbAeBCBC04F14C3f624E67A35165` |
+| vault0 (Wrapped Aave WETH) | `0xde7820fFb73059608928cb9e29F6EB1369Ad1342` |
+| vault1 (Wrapped Aave USDC) | `0xf430cb6E2b85f99222fBFA6dFEa18Ff60FA6B32a` |
+| WETH / USDC (underlyings) | `0x4200…0006` / `0xba50Cd2A20f6DA35D788639E581bca8d0B5d4D5f` |
 | CREATE2 deployer | `0x4e59b44847b379578588920cA78FbF26c0B4956C` |
 
-**Base mainnet (8453) addresses (reference)**
+**Base mainnet (8453) reference vaults**
 
-| Contract | Address |
+| Item | Address |
 |---|---|
-| v4 `PoolManager` | `0x498581fF718922c3f8e6A244956aF099B2652b2b` |
-| Aave v3 `Pool` | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5` |
-| WETH / aWETH | `0x4200000000000000000000000000000000000006` / `0xD4a0e0b9149BCEE3C920d2E00b5dE09138fd8bb7` |
-| USDC (Circle) / aUSDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` / `0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB` |
-| Chainlink ETH/USD (price only) | `0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70` |
-| Chainlink USDC/USD (price only) | `0x7e860098F58bBFC8648a4311b374B1D669a2bc6B` |
+| vault0 (Wrapped Aave WETH) | `0xe298b938631f750DD409fB18227C4a23dCdaab9b` |
+| vault1 (Wrapped Aave USDC) | `0xC768c589647798a6EE01A91FdE98EF2ed046DBD6` |
+| Morpho USDC (mixed tests) | `0xBEEFE94c8aD530842bfE7d8B397938fFc1cb83b2` |
 
-Pool: WETH `currency0`, USDC `currency1`, fee/spacing configurable (500 / 10 by default).
-Chainlink is used **only off-chain/in the deploy script to pick the starting price**; the hook
-itself never reads an oracle.
+Pool currency pair is whatever the two vaults' assets are; fee/spacing configurable (500 / 10 by
+default). Chainlink is used **only in the deploy script** to pick the starting price; the hook never
+reads an oracle.
 
 ## Build
 
@@ -530,16 +506,15 @@ forge test
 
 ```
 src/
-  SuperpositionHook.sol        hook + vault (buckets, JIT, Aave, yield)
+  SuperpositionHook.sol        hook + vault (buckets, JIT, ERC-4626, yield)
   BucketShares.sol             ERC-1155 share token, one id per range
   libraries/
     HookMiner.sol              CREATE2 salt search for v4 permission bits
   interfaces/
-    IAavePool.sol              Aave v3 pool subset
     IAggregatorV3.sol          Chainlink feed subset (deploy scripts only)
 test/
   BaseSepoliaFork.t.sol            Base Sepolia TESTNET fork suite (deployment target)
-  SuperpositionHookBaseFork.t.sol  Base mainnet fork suite (reference)
+  SuperpositionHookBaseFork.t.sol  Base mainnet fork suite (incl. mixed Aave/Morpho)
   LiquidityAmounts.t.sol           canonical periphery math
   helpers/TestSwapRouter.sol       minimal v4 swap router for tests
 script/
@@ -551,12 +526,13 @@ script/
 
 ## 17. Limitations & roadmap
 
-- **Same-token valuation is pool-derived.** Manipulating the pool right before a deposit is a
-  residual concern for two-sided in-range buckets (one-sided buckets need no price); a TWAP would
-  harden it.
-- **Partial Aave deployment** up to a supply-cap headroom (instead of all-or-nothing).
+- **Vault coverage.** A token is usable only where an ERC-4626 vault for it exists (Aave wrapper,
+  Morpho, Euler, Spark, Yearn, or one minted via `STATA_FACTORY`).
+- **Pool-price valuation.** Manipulating the pool right before a deposit is a residual concern for
+  two-sided in-range buckets (one-sided buckets need no price); a TWAP would harden it.
+- **Partial vault deposit** up to a cap (instead of all-or-nothing).
 - **Multi-pair factory** and an **external adapter** exposing each bucket position.
-- Large exits bounded by Aave liquidity may need batching.
+- Large exits bounded by vault liquidity may need batching.
 
 ---
 

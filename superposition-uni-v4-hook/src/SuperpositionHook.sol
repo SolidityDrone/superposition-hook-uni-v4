@@ -4,6 +4,7 @@ pragma solidity 0.8.30;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
@@ -21,18 +22,21 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
-import {IAavePool} from "./interfaces/IAavePool.sol";
 import {BucketShares} from "./BucketShares.sol";
 
 /// @title SuperpositionHook
-/// @notice A Uniswap v4 concentrated-liquidity hook that keeps 100% of pooled capital earning
-///         yield in Aave v3 and tracks ownership **per tick range**.
-/// @dev The pool's liquidity is virtual: between swaps all tokens sit in Aave as aWETH/aUSDC.
-///      `beforeSwap` withdraws them and materializes every range as real v4 liquidity;
-///      `afterSwap` removes the ranges, takes the proceeds and fees, and supplies everything
-///      back to Aave. Ownership is per bucket `(tickLower, tickUpper)`, so an out-of-range
-///      one-sided deposit is a real limit order and can be withdrawn one-sided. Yield is
-///      distributed per token; no external oracle is used.
+/// @notice A Uniswap v4 concentrated-liquidity hook that keeps 100% of pooled capital in an
+///         external **ERC-4626 lending vault** (per side) between swaps and tracks ownership per
+///         tick range.
+/// @dev The hook is protocol-agnostic: it only talks ERC-4626. Pass any two vaults whose `asset()`
+///      are the pool currencies — e.g. a Morpho MetaMorpho vault, an Euler v2 EVault, a Spark
+///      Savings vault, an Aave ERC-4626 wrapper, or a Yearn vault, in any combination. There is no
+///      protocol-specific branch or function here.
+///
+///      Pool liquidity is virtual: between swaps the capital sits in the vaults. `beforeSwap`
+///      redeems them and materializes every range as real v4 liquidity; `afterSwap` removes the
+///      ranges, takes proceeds and fees, and deposits everything back. Ownership is per bucket
+///      `(tickLower, tickUpper)`, so an out-of-range one-sided deposit is a genuine limit order.
 contract SuperpositionHook is IHooks, Ownable {
     using PoolIdLibrary for PoolKey;
     using SafeERC20 for IERC20;
@@ -68,7 +72,7 @@ contract SuperpositionHook is IHooks, Ownable {
     /// @notice Thrown when the caller is neither the share owner nor an approved operator.
     error NotAuthorized();
 
-    /// @dev Extra wei pulled per token to absorb Aave's per-supply index rounding (see deposit).
+    /// @dev Extra wei pulled per token to absorb vault share/asset rounding (see deposit).
     uint256 internal constant DEPOSIT_BUFFER = 1000;
 
     // ---------------------------------------------------------------------
@@ -76,13 +80,6 @@ contract SuperpositionHook is IHooks, Ownable {
     // ---------------------------------------------------------------------
 
     /// @notice Aggregate state of one tick range.
-    /// @param lower Lower tick bound.
-    /// @param upper Upper tick bound.
-    /// @param liquidity Total v4 liquidity in this range.
-    /// @param shares Total internal shares of this bucket.
-    /// @param c0 WETH claim of the bucket (underlying, including accrued yield).
-    /// @param c1 USDC claim of the bucket (underlying, including accrued yield).
-    /// @param active Whether the bucket currently holds liquidity.
     struct Bucket {
         int24 lower;
         int24 upper;
@@ -96,10 +93,10 @@ contract SuperpositionHook is IHooks, Ownable {
     /// @notice Arguments for `deposit`.
     /// @param tickLower Lower tick bound of the position.
     /// @param tickUpper Upper tick bound of the position.
-    /// @param amount0Desired Max WETH the caller is willing to spend (buffer included).
-    /// @param amount1Desired Max USDC the caller is willing to spend (buffer included).
-    /// @param amount0Min Slippage floor on the WETH actually required.
-    /// @param amount1Min Slippage floor on the USDC actually required.
+    /// @param amount0Desired Max token0 the caller is willing to spend (buffer included).
+    /// @param amount1Desired Max token1 the caller is willing to spend (buffer included).
+    /// @param amount0Min Slippage floor on the token0 actually required.
+    /// @param amount1Min Slippage floor on the token1 actually required.
     /// @param recipient Receiver of the minted bucket shares.
     struct DepositParams {
         int24 tickLower;
@@ -131,16 +128,14 @@ contract SuperpositionHook is IHooks, Ownable {
 
     /// @notice The v4 singleton that owns all pool state.
     IPoolManager public immutable poolManager;
-    /// @notice The Aave v3 pool used for yield.
-    address public immutable aavePool;
-    /// @notice Wrapped ETH (currency0).
-    IERC20 public immutable weth;
-    /// @notice USD Coin (currency1).
-    IERC20 public immutable usdc;
-    /// @notice Aave interest-bearing WETH, held by the vault.
-    IERC20 public immutable aWeth;
-    /// @notice Aave interest-bearing USDC, held by the vault.
-    IERC20 public immutable aUsdc;
+    /// @notice ERC-4626 vault holding token0 (bank for currency0).
+    IERC4626 public immutable vault0;
+    /// @notice ERC-4626 vault holding token1 (bank for currency1).
+    IERC4626 public immutable vault1;
+    /// @notice Underlying token of `vault0` and currency0 of the pool.
+    IERC20 public immutable token0;
+    /// @notice Underlying token of `vault1` and currency1 of the pool.
+    IERC20 public immutable token1;
     /// @notice ERC-1155 share token; one id per bucket.
     BucketShares public immutable shareToken;
 
@@ -165,9 +160,9 @@ contract SuperpositionHook is IHooks, Ownable {
     mapping(bytes32 => int256) internal jitAdd0;
     mapping(bytes32 => int256) internal jitAdd1;
 
-    /// @notice Cached sum of every bucket's WETH claim.
+    /// @notice Cached sum of every bucket's token0 claim.
     uint256 public totalC0;
-    /// @notice Cached sum of every bucket's USDC claim.
+    /// @notice Cached sum of every bucket's token1 claim.
     uint256 public totalC1;
 
     // ---------------------------------------------------------------------
@@ -212,47 +207,42 @@ contract SuperpositionHook is IHooks, Ownable {
         _;
     }
 
-    /// @notice Deploys the hook for a single WETH/USDC pool.
-    /// @dev `initialOwner` is explicit because CREATE2 deployment via the deterministic proxy makes
-    ///      `msg.sender` the proxy, not the deployer. `fee`/`tickSpacing` are configurable so the
-    ///      same hook can serve a 1-tick limit-order pool (`tickSpacing = 1`).
+    /// @notice Deploys the hook for a single pool backed by two ERC-4626 lending vaults.
+    /// @dev The pool currencies are taken from `vault0.asset()` / `vault1.asset()`, which must be
+    ///      sorted ascending (v4 requires `currency0 < currency1`). `initialOwner` is explicit
+    ///      because CREATE2 deployment via the deterministic proxy makes `msg.sender` the proxy.
     /// @param _poolManager The v4 PoolManager singleton.
-    /// @param _aavePool The Aave v3 pool.
-    /// @param _weth WETH address (must sort before USDC).
-    /// @param _usdc USDC address.
-    /// @param _aWeth Aave interest-bearing WETH.
-    /// @param _aUsdc Aave interest-bearing USDC.
-    /// @param fee Pool LP fee.
-    /// @param tickSpacing Pool tick spacing.
+    /// @param _vault0 ERC-4626 vault whose asset is currency0.
+    /// @param _vault1 ERC-4626 vault whose asset is currency1.
+    /// @param _fee Pool LP fee.
+    /// @param _tickSpacing Pool tick spacing.
     /// @param initialOwner Owner allowed to initialize the pool.
     constructor(
         IPoolManager _poolManager,
-        address _aavePool,
-        address _weth,
-        address _usdc,
-        address _aWeth,
-        address _aUsdc,
-        uint24 fee,
-        int24 tickSpacing,
+        IERC4626 _vault0,
+        IERC4626 _vault1,
+        uint24 _fee,
+        int24 _tickSpacing,
         address initialOwner
     ) Ownable(initialOwner) {
-        require(_weth < _usdc, "currencies out of order");
+        address a0 = _vault0.asset();
+        address a1 = _vault1.asset();
+        require(a0 < a1, "assets out of order");
 
         poolManager = _poolManager;
-        aavePool = _aavePool;
-        weth = IERC20(_weth);
-        usdc = IERC20(_usdc);
-        aWeth = IERC20(_aWeth);
-        aUsdc = IERC20(_aUsdc);
+        vault0 = _vault0;
+        vault1 = _vault1;
+        token0 = IERC20(a0);
+        token1 = IERC20(a1);
 
         // The hook owns the share token so it is the only minter/burner.
         shareToken = new BucketShares("", address(this));
 
         poolKey = PoolKey({
-            currency0: Currency.wrap(_weth),
-            currency1: Currency.wrap(_usdc),
-            fee: fee,
-            tickSpacing: tickSpacing,
+            currency0: Currency.wrap(a0),
+            currency1: Currency.wrap(a1),
+            fee: _fee,
+            tickSpacing: _tickSpacing,
             hooks: IHooks(address(this))
         });
         poolId = poolKey.toId();
@@ -271,9 +261,9 @@ contract SuperpositionHook is IHooks, Ownable {
         initialized = true;
     }
 
-    /// @notice Adds liquidity to a tick range and supplies it to Aave, minting bucket shares.
+    /// @notice Adds liquidity to a tick range and deposits it into the lending vaults.
     /// @dev Only the tokens the range actually requires are pulled, so a range fully below spot
-    ///      needs only USDC and a range fully above spot needs only WETH: a real limit order.
+    ///      needs only token1 and a range fully above spot needs only token0: a real limit order.
     ///
     ///      Shares are minted at the current **pool price**:
     ///      `shares = valueIn * bucket.shares / valueBefore`. Because the deposit is priced the same
@@ -291,7 +281,7 @@ contract SuperpositionHook is IHooks, Ownable {
         (uint160 sqrtP,,,) = StateLibrary.getSlot0(poolManager, poolId);
         if (sqrtP == 0) revert PoolNotInitialized();
 
-        // Bring every bucket's claim up to date (Aave yield) before pricing this deposit.
+        // Bring every bucket's claim up to date before pricing this deposit.
         _syncYield();
 
         uint160 sqrtLower = TickMath.getSqrtPriceAtTick(p.tickLower);
@@ -308,8 +298,8 @@ contract SuperpositionHook is IHooks, Ownable {
             _requiredAmounts(sqrtP, sqrtLower, sqrtUpper, liquidity);
         if (amount0 < p.amount0Min || amount1 < p.amount1Min) revert Slippage();
 
-        // Aave's liquidity index rounds down by a few wei; keep a buffer so the range can always
-        // be re-materialized exactly.
+        // Vault share/asset rounding can leave the position a few wei short; keep a buffer so the
+        // range can always be re-materialized exactly.
         uint256 pull0 = amount0 == 0 ? 0 : amount0 + DEPOSIT_BUFFER;
         uint256 pull1 = amount1 == 0 ? 0 : amount1 + DEPOSIT_BUFFER;
         if (pull0 > p.amount0Desired || pull1 > p.amount1Desired) revert Slippage();
@@ -349,24 +339,24 @@ contract SuperpositionHook is IHooks, Ownable {
         totalC0 += pull0;
         totalC1 += pull1;
 
-        if (pull0 > 0) weth.safeTransferFrom(msg.sender, address(this), pull0);
-        if (pull1 > 0) usdc.safeTransferFrom(msg.sender, address(this), pull1);
-        _supply(weth, pull0);
-        _supply(usdc, pull1);
+        if (pull0 > 0) token0.safeTransferFrom(msg.sender, address(this), pull0);
+        if (pull1 > 0) token1.safeTransferFrom(msg.sender, address(this), pull1);
+        _deposit(token0, vault0, pull0);
+        _deposit(token1, vault1, pull1);
 
         emit Deposited(p.recipient, p.tickLower, p.tickUpper, liquidity, pull0, pull1, sharesMinted);
     }
 
     /// @notice Burns bucket shares and pays out the bucket's pro-rata token claim.
-    /// @dev If the bucket is one-sided (range out of the money), the payout is one-sided: the
-    ///      owner of a resting USDC bid receives USDC, or WETH once the price crossed.
+    /// @dev If the bucket is one-sided (range out of the money), the payout is one-sided: the owner
+    ///      of a resting token1 bid receives token1, or token0 once the price crossed.
     /// @param p Withdraw parameters.
-    /// @return wethOut WETH paid out.
-    /// @return usdcOut USDC paid out.
+    /// @return amount0 token0 paid out.
+    /// @return amount1 token1 paid out.
     function withdraw(WithdrawParams calldata p)
         external
         notJit
-        returns (uint256 wethOut, uint256 usdcOut)
+        returns (uint256 amount0, uint256 amount1)
     {
         if (p.shareAmount == 0) revert ZeroShares();
         bytes32 key = _bucketKey(p.tickLower, p.tickUpper);
@@ -383,30 +373,30 @@ contract SuperpositionHook is IHooks, Ownable {
 
         Bucket storage b = buckets[idx - 1];
         uint256 total = b.shares;
-        wethOut = Math.mulDiv(b.c0, p.shareAmount, total);
-        usdcOut = Math.mulDiv(b.c1, p.shareAmount, total);
+        amount0 = Math.mulDiv(b.c0, p.shareAmount, total);
+        amount1 = Math.mulDiv(b.c1, p.shareAmount, total);
         uint128 dl = uint128(Math.mulDiv(b.liquidity, p.shareAmount, total));
 
-        b.c0 -= wethOut;
-        b.c1 -= usdcOut;
+        b.c0 -= amount0;
+        b.c1 -= amount1;
         b.liquidity -= dl;
         b.shares = total - p.shareAmount;
         shareToken.burn(p.owner, uint256(key), p.shareAmount);
-        totalC0 -= wethOut;
-        totalC1 -= usdcOut;
+        totalC0 -= amount0;
+        totalC1 -= amount1;
         if (b.liquidity == 0) b.active = false;
 
-        // Aave's index rounding can leave the bucket claim a few wei above the real aToken
-        // balance; pay out at most what is actually held.
-        wethOut = _payout(weth, aWeth, wethOut, p.recipient);
-        usdcOut = _payout(usdc, aUsdc, usdcOut, p.recipient);
+        // Vault rounding can leave the bucket claim a few wei above the real position; pay out at
+        // most what is actually held.
+        amount0 = _payout(token0, vault0, amount0, p.recipient);
+        amount1 = _payout(token1, vault1, amount1, p.recipient);
 
         emit Withdrawn(
-            p.owner, p.recipient, p.tickLower, p.tickUpper, p.shareAmount, wethOut, usdcOut
+            p.owner, p.recipient, p.tickLower, p.tickUpper, p.shareAmount, amount0, amount1
         );
     }
 
-    /// @notice Realizes accrued Aave yield into the buckets. Idempotent and safe to call anytime
+    /// @notice Realizes accrued vault yield into the buckets. Idempotent and safe to call anytime
     ///         off the JIT window; also lets an integrator refresh claims before quoting.
     function syncYield() external notJit {
         _syncYield();
@@ -416,18 +406,20 @@ contract SuperpositionHook is IHooks, Ownable {
     // V I E W S
     //////////////////////////////////////////////////////////////////
 
-    /// @notice Real holdings of the vault: idle balance plus aToken balances.
-    /// @return wethAmt WETH held (idle + aWETH).
-    /// @return usdcAmt USDC held (idle + aUSDC).
-    function currentBalance() public view returns (uint256 wethAmt, uint256 usdcAmt) {
-        wethAmt = weth.balanceOf(address(this)) + aWeth.balanceOf(address(this));
-        usdcAmt = usdc.balanceOf(address(this)) + aUsdc.balanceOf(address(this));
+    /// @notice Real holdings of the vault: idle balance plus each lending vault position.
+    /// @return amount0 token0 held (idle + vault0 position).
+    /// @return amount1 token1 held (idle + vault1 position).
+    function currentBalance() public view returns (uint256 amount0, uint256 amount1) {
+        amount0 = token0.balanceOf(address(this))
+            + vault0.convertToAssets(vault0.balanceOf(address(this)));
+        amount1 = token1.balanceOf(address(this))
+            + vault1.convertToAssets(vault1.balanceOf(address(this)));
     }
 
     /// @notice The token composition the vault would have if every range were materialized now.
-    /// @return wethAmt WETH required by all active buckets at the current price.
-    /// @return usdcAmt USDC required by all active buckets at the current price.
-    function virtualBalance() public view returns (uint256 wethAmt, uint256 usdcAmt) {
+    /// @return amount0 token0 required by all active buckets at the current price.
+    /// @return amount1 token1 required by all active buckets at the current price.
+    function virtualBalance() public view returns (uint256 amount0, uint256 amount1) {
         (uint160 sqrtP,,,) = StateLibrary.getSlot0(poolManager, poolId);
         if (sqrtP == 0) return (0, 0);
         uint256 len = buckets.length;
@@ -440,13 +432,13 @@ contract SuperpositionHook is IHooks, Ownable {
                 TickMath.getSqrtPriceAtTick(b.upper),
                 b.liquidity
             );
-            wethAmt += a0;
-            usdcAmt += a1;
+            amount0 += a0;
+            amount1 += a1;
         }
     }
 
     /// @notice Cached sum of all buckets' token claims (underlying).
-    /// @return The vault's total WETH and USDC claims.
+    /// @return The vault's total token0 and token1 claims.
     function totalClaim() external view returns (uint256, uint256) {
         return (totalC0, totalC1);
     }
@@ -469,7 +461,7 @@ contract SuperpositionHook is IHooks, Ownable {
         return idx == 0 ? 0 : buckets[idx - 1].shares;
     }
 
-    /// @notice Value of a bucket in USDC terms at the current pool price (1 wei = 1e-6 USDC units).
+    /// @notice Value of a bucket in token1 terms at the current pool price.
     /// @param lower Lower tick bound.
     /// @param upper Upper tick bound.
     /// @return The bucket claim value.
@@ -554,10 +546,10 @@ contract SuperpositionHook is IHooks, Ownable {
         return (IHooks.afterRemoveLiquidity.selector, BalanceDelta.wrap(0));
     }
 
-    /// @notice JIT step 1: sync yield, fund the pool and materialize every active bucket.
-    /// @dev Withdraws all aTokens to underlying, distributes Aave yield across buckets, then adds
-    ///      each bucket as a real v4 position and settles what those positions owe the PoolManager.
-    ///      The per-bucket add delta is stored for `afterSwap`.
+    /// @notice JIT step 1: sync yield, redeem the vaults and materialize every active bucket.
+    /// @dev Redeems all lending vault shares to underlying, distributes yield across buckets, then
+    ///      adds each bucket as a real v4 position and settles what those positions owe the
+    ///      PoolManager. The per-bucket add delta is stored for `afterSwap`.
     /// @return The callback selector.
     /// @return A zero before-swap delta.
     /// @return A zero LP fee override.
@@ -570,7 +562,7 @@ contract SuperpositionHook is IHooks, Ownable {
         if (_activeLiquidity() == 0) revert NoLiquidity();
 
         jitActive = true;
-        _withdrawAllFromAave();
+        _redeemAll();
 
         // Now the hook holds all underlying: distribute the yield accrued since the last cycle.
         _syncYield();
@@ -602,11 +594,11 @@ contract SuperpositionHook is IHooks, Ownable {
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @notice JIT step 2: remove every bucket, attribute PnL and fees, and re-supply to Aave.
+    /// @notice JIT step 2: remove every bucket, attribute PnL and fees, and re-deposit to the vaults.
     /// @dev Removing a bucket credits the hook a positive delta which is `take`n out. The bucket's
     ///      claim moves by the net of its add and remove deltas, so swap principal change and fees
     ///      land on the bucket that produced them. All PoolManager deltas are settled before the
-    ///      Aave supply leg, so a caught supply failure never leaves an unsettled delta.
+    ///      vault deposit leg, so a caught deposit failure never leaves an unsettled delta.
     /// @return The callback selector.
     /// @return A zero hook delta.
     function afterSwap(
@@ -651,8 +643,8 @@ contract SuperpositionHook is IHooks, Ownable {
         totalC1 = uint256(int256(totalC1) + net1);
 
         // Re-deploy everything; any leftover simply stays idle until the next cycle.
-        _supply(weth, weth.balanceOf(address(this)));
-        _supply(usdc, usdc.balanceOf(address(this)));
+        _deposit(token0, vault0, token0.balanceOf(address(this)));
+        _deposit(token1, vault1, token1.balanceOf(address(this)));
 
         jitActive = false;
         return (IHooks.afterSwap.selector, 0);
@@ -685,24 +677,22 @@ contract SuperpositionHook is IHooks, Ownable {
         return keccak256(abi.encodePacked(lower, upper));
     }
 
-    /// @dev Bucket claim value in USDC terms at `sqrtP`: `value = c1 + c0 * price`.
+    /// @dev Bucket claim value in token1 terms at `sqrtP`: `value = c1 + c0 * price`.
     function _valueAtPrice(uint256 x0, uint256 x1, uint160 sqrtP) internal pure returns (uint256) {
         if (x0 == 0) return x1;
         uint256 pX96 = Math.mulDiv(sqrtP, sqrtP, 1 << 96); // raw token1 per token0, scaled by 2^96
         return x1 + Math.mulDiv(x0, pX96, 1 << 96);
     }
 
-    /// @dev Distributes accrued Aave yield across buckets, per token, pro-rata to their claims.
+    /// @dev Distributes accrued vault yield across buckets, per token, pro-rata to their claims.
     ///      Yield is uniform per token, so no per-bucket history is needed; the cached totals are
-    ///      then pinned to the real balances.
+    ///      then raised to the real balances (never lowered, to avoid underflow on withdrawal).
     function _syncYield() internal {
         (uint256 r0, uint256 r1) = currentBalance();
         uint256 t0 = totalC0;
         uint256 t1 = totalC1;
         uint256 len = buckets.length;
 
-        // Only ever grow the cached totals: `r` can be a few wei below the claims right after a
-        // supply (Aave index rounding), and pulling the cache down would underflow on withdrawal.
         if (r0 > t0 && t0 > 0) {
             uint256 yield0 = r0 - t0;
             for (uint256 i = 0; i < len; i++) {
@@ -740,19 +730,32 @@ contract SuperpositionHook is IHooks, Ownable {
         }
     }
 
-    /// @dev Supplies `amount` to Aave. On failure (paused/frozen reserve) tokens stay idle.
-    function _supply(IERC20 token, uint256 amount) internal {
+    /// @dev Deposits `amount` into the ERC-4626 `vault`. On failure tokens stay idle in the hook.
+    function _deposit(IERC20 token, IERC4626 vault, uint256 amount) internal {
         if (amount == 0) return;
-        token.forceApprove(aavePool, amount);
-        try IAavePool(aavePool).supply(address(token), amount, address(this), 0) {}
+        token.forceApprove(address(vault), amount);
+        try vault.deposit(amount, address(this)) {}
         catch {
-            token.forceApprove(aavePool, 0);
+            // Drop the dangling allowance; the tokens remain in the hook and count in balances.
+            token.forceApprove(address(vault), 0);
         }
     }
 
-    /// @dev Pays up to `amount` of `token` to `to`, using idle balance first then Aave, and
-    ///      returns the amount actually paid (clamped to real liquidity).
-    function _payout(IERC20 token, IERC20 aToken, uint256 amount, address to)
+    /// @dev Redeems the entire position of `vault` back to underlying held by the hook.
+    function _redeemAll(IERC4626 vault) internal {
+        uint256 shares = vault.balanceOf(address(this));
+        if (shares > 0) vault.redeem(shares, address(this), address(this));
+    }
+
+    /// @dev Redeems both lending vaults to idle underlying (JIT funding step).
+    function _redeemAll() internal {
+        _redeemAll(vault0);
+        _redeemAll(vault1);
+    }
+
+    /// @dev Pays up to `amount` of `token` to `to`, using idle balance first then the vault, and
+    ///      returns the amount actually paid (clamped to the real position).
+    function _payout(IERC20 token, IERC4626 vault, uint256 amount, address to)
         internal
         returns (uint256 paid)
     {
@@ -765,10 +768,10 @@ contract SuperpositionHook is IHooks, Ownable {
         if (idle > 0) token.safeTransfer(to, idle);
 
         uint256 remaining = amount - idle;
-        uint256 aBal = aToken.balanceOf(address(this));
-        uint256 fromAave = remaining > aBal ? aBal : remaining;
-        if (fromAave > 0) IAavePool(aavePool).withdraw(address(token), fromAave, to);
-        paid = idle + fromAave;
+        uint256 position = vault.convertToAssets(vault.balanceOf(address(this)));
+        uint256 fromVault = remaining > position ? position : remaining;
+        if (fromVault > 0) vault.withdraw(fromVault, to, address(this));
+        paid = idle + fromVault;
     }
 
     /// @dev Sum of liquidity across active buckets; used to reject swaps with no depth.
@@ -777,14 +780,6 @@ contract SuperpositionHook is IHooks, Ownable {
         for (uint256 i = 0; i < len; i++) {
             if (buckets[i].active) total += buckets[i].liquidity;
         }
-    }
-
-    /// @dev JIT: pull the entire yield position back into underlying so it can back the swap.
-    function _withdrawAllFromAave() internal {
-        uint256 aW = aWeth.balanceOf(address(this));
-        uint256 aU = aUsdc.balanceOf(address(this));
-        if (aW > 0) IAavePool(aavePool).withdraw(address(weth), aW, address(this));
-        if (aU > 0) IAavePool(aavePool).withdraw(address(usdc), aU, address(this));
     }
 
     /// @dev Pays the PoolManager whatever the just-added liquidity owes it.
