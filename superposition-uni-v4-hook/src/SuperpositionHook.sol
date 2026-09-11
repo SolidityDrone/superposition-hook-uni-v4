@@ -293,6 +293,7 @@ contract SuperpositionHook is IHooks, Ownable {
     function beforeAddLiquidity(address sender, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, bytes calldata)
         external
         view
+        onlyPoolManager
         returns (bytes4)
     {
         if (sender != address(this)) revert OnlyHook();
@@ -315,7 +316,7 @@ contract SuperpositionHook is IHooks, Ownable {
         PoolKey calldata,
         IPoolManager.ModifyLiquidityParams calldata,
         bytes calldata
-    ) external view returns (bytes4) {
+    ) external view onlyPoolManager returns (bytes4) {
         if (sender != address(this)) revert OnlyHook();
         return IHooks.beforeRemoveLiquidity.selector;
     }

@@ -352,4 +352,105 @@ contract SuperpositionHookBaseForkTest is Test {
         assertGt(IERC20(USDC).balanceOf(address(hook)), 0);
         assertGt(hook.totalAssets(), 0);
     }
+
+    function test_non_manager_hook_calls_revert() public {
+        PoolKey memory key = _poolKey();
+        IPoolManager.ModifyLiquidityParams memory params =
+            IPoolManager.ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 0, salt: 0});
+
+        vm.expectRevert(SuperpositionHook.NotPoolManager.selector);
+        hook.beforeAddLiquidity(address(0xBAD), key, params, "");
+
+        vm.expectRevert(SuperpositionHook.NotPoolManager.selector);
+        hook.beforeRemoveLiquidity(address(0xBAD), key, params, "");
+
+        vm.expectRevert(SuperpositionHook.NotPoolManager.selector);
+        hook.beforeSwap(address(0xBAD), key, IPoolManager.SwapParams(false, 0, 0), "");
+    }
+
+    function test_direct_lp_modify_reverts() public {
+        DirectLpAttacker attacker = new DirectLpAttacker(PM);
+        vm.expectRevert();
+        attacker.attack(_poolKey());
+    }
+
+    function test_fork_withdraw_after_swap() public {
+        (uint256 shares,,,,,) = _depositDefault(1e18, 3000e6);
+        TestSwapRouter router = new TestSwapRouter(PM);
+        vm.prank(lp);
+        IERC20(WETH).approve(address(router), type(uint256).max);
+        vm.prank(lp);
+        router.swap(_poolKey(), true, -0.01e18, TickMath.MIN_SQRT_PRICE + 1, lp);
+
+        vm.prank(lp);
+        (uint256 wOut, uint256 uOut) = hook.withdraw(shares, lp);
+
+        assertGt(wOut + uOut, 0);
+        assertEq(hook.balanceOf(lp), 0);
+        assertApproxEqAbs(hook.totalAssets(), 0, 10);
+    }
+
+    function test_fork_multi_lp_full_exit() public {
+        address lp2 = address(0xA11CE);
+        deal(WETH, lp2, 100e18);
+        deal(USDC, lp2, 1_000_000e6);
+        vm.startPrank(lp2);
+        IERC20(WETH).approve(address(hook), type(uint256).max);
+        IERC20(USDC).approve(address(hook), type(uint256).max);
+        vm.stopPrank();
+
+        (uint256 s1,,,,,) = _depositDefault(1e18, 3000e6);
+
+        int24 base = _floor(currentTick, 10);
+        vm.prank(lp2);
+        uint256 s2 = hook.deposit(
+            SuperpositionHook.DepositParams({
+                tickLower: base - 600,
+                tickUpper: base + 600,
+                amount0Desired: 0.5e18,
+                amount1Desired: 1500e6,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: lp2
+            })
+        );
+        assertGt(s1, 0);
+        assertGt(s2, 0);
+
+        vm.prank(lp);
+        hook.withdraw(s1, lp);
+        vm.prank(lp2);
+        hook.withdraw(s2, lp2);
+
+        assertEq(hook.balanceOf(lp), 0);
+        assertEq(hook.balanceOf(lp2), 0);
+        assertEq(hook.totalSupply(), 0);
+        assertApproxEqAbs(hook.totalAssets(), 0, 10);
+        SuperpositionHook.Range[] memory rs = hook.getRanges();
+        assertFalse(rs[0].active);
+    }
+}
+
+/// @notice Tries to LP the pool directly, bypassing the vault; must be rejected.
+contract DirectLpAttacker {
+    IPoolManager public immutable manager;
+
+    constructor(IPoolManager _manager) {
+        manager = _manager;
+    }
+
+    function attack(PoolKey calldata key) external {
+        manager.unlock(abi.encode(key));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "not manager");
+        PoolKey memory key = abi.decode(data, (PoolKey));
+        manager.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 1e15, salt: 0}),
+            ""
+        );
+        return "";
+    }
 }
