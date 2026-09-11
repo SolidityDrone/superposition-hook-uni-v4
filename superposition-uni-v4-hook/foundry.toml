@@ -13,6 +13,7 @@ fs_permissions = [{ access = "read", path = "./" }]
 
 [rpc_endpoints]
 base = "https://mainnet.base.org"
+base_sepolia = "https://sepolia.base.org"
 
 [fmt]
 line_length = 100

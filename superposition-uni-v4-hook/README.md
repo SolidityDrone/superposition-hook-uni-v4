@@ -6,10 +6,14 @@
 <p align="center">
   <img alt="Solidity" src="https://img.shields.io/badge/Solidity-0.8.26-363636?logo=solidity" />
   <img alt="Foundry" src="https://img.shields.io/badge/Built%20with-Foundry-ffb300" />
-  <img alt="Network" src="https://img.shields.io/badge/Tested%20on-Base%20mainnet%20fork-0052ff" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-21%20passing-brightgreen" />
+  <img alt="Testnet" src="https://img.shields.io/badge/Testnet-Base%20Sepolia%2084532-0052ff" />
+  <img alt="Mainnet" src="https://img.shields.io/badge/Also%20fork%20tested-Base%20mainnet-0052ff" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-25%20passing-brightgreen" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue" />
 </p>
+
+> **Deployment target: Base Sepolia (chain id 84532) — TESTNET.** The contract is additionally
+> fork-tested on Base mainnet as a reference.
 
 A Uniswap v4 concentrated-liquidity hook whose capital sits **100% in Aave v3** between
 swaps. Liquidity is *virtual*: real v4 positions are materialized for the duration of a swap
@@ -467,8 +471,11 @@ event Withdrawn(address indexed owner, address indexed recipient,
 
 ## 14. Testing
 
-`forge test` — **21 tests passing** against a Base mainnet fork with real contracts (Uniswap v4,
-Aave v3, Chainlink), no mocks except a forced Aave failure.
+`forge test` — **25 tests passing** across two forks with real contracts (Uniswap v4, Aave v3,
+Chainlink), no mocks except a forced Aave failure.
+
+- `BaseSepoliaForkTest` — **the deployment target: Base Sepolia (chain id 84532, TESTNET)**
+- `SuperpositionHookBaseForkTest` — Base mainnet fork (reference, deeper market)
 
 | Test | Proves |
 |---|---|
@@ -488,29 +495,47 @@ Aave v3, Chainlink), no mocks except a forced Aave failure.
 | `test_direct_lp_modify_reverts` | direct LPing is rejected |
 | `LiquidityAmounts.t.sol`, `ShareMath.t.sol` | one-sided math and share math |
 
+**Base Sepolia testnet suite** (the deployment target)
+
+| Test | Proves |
+|---|---|
+| `test_sepolia_deploy_and_deposit` | hook deploys, pool initializes, deposit reaches Aave |
+| `test_sepolia_jit_swap` | full JIT swap on the testnet stack |
+| `test_sepolia_withdraw` | pro-rata exit on the testnet stack |
+| `test_sepolia_usdc_only_limit_order` | one-sided USDC limit order on the testnet stack |
+
 ---
 
 ## 15. Deployment
 
+> **TESTNET.** The deployment target is **Base Sepolia (chain id 84532)**. The script reverts on
+> any other chain id. On Base Sepolia the vault uses **Aave's USDC test asset** (`0xba50Cd2A…d4D5f`),
+> not the Circle USDC (`0x036CbD…`), because that is the token the Aave reserve supports.
+
 ```bash
-forge script script/DeployHook.s.sol --rpc-url base --broadcast
+forge script script/DeployHook.s.sol --rpc-url base_sepolia --broadcast --private-key <KEY>
 ```
 
 The script mines the permission salt, deploys through the deterministic CREATE2 proxy, and
-initializes the ETH/USDC pool at the price implied by the live Chainlink feeds.
+initializes the WETH/USDC pool at the price implied by the live Chainlink feeds.
 
-**Base addresses**
+**Base Sepolia (84532, TESTNET) addresses**
 
 | Contract | Address |
 |---|---|
-| v4 `PoolManager` | `0x498581fF718922c3f8e6A244956aF099B2652b2b` |
-| Aave v3 `Pool` | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5` |
-| WETH / aWETH | `0x4200…0006` / `0xD4a0e0b9149BCee3C920d2E00b5dE09138fd8bb7` |
-| USDC / aUSDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` / `0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB` |
-| Chainlink ETH/USD | `0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70` |
-| Chainlink USDC/USD | `0x7e860098F58bBFC8648a4311b374B1D669a2bc6B` |
+| v4 `PoolManager` | `0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408` |
+| Aave v3 `Pool` | `0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27` |
+| WETH / aWETH | `0x4200…0006` / `0x73a5bB60b0B0fc35710DDc0ea9c407031E31Bdbb` |
+| USDC (Aave test) / aUSDC | `0xba50Cd2A20f6DA35D788639E581bca8d0B5d4D5f` / `0x10F1A9D11CDf50041f3f8cB7191CBE2f31750ACC` |
+| Chainlink ETH/USD | `0x4aDC67696bA383F43DD60A9e78F2C97Fbbfc7cb1` |
+| Chainlink USDC/USD | `0xd30e2101a97dcbAeBCBC04F14C3f624E67A35165` |
+| CREATE2 deployer | `0x4e59b44847b379578588920cA78FbF26c0B4956C` |
 
 Pool: WETH `currency0`, USDC `currency1`, fee `500`, tickSpacing `10`.
+
+For reference, the contract was also validated on a **Base mainnet fork** (v4 `0x4985…2b2b`,
+Aave `0xA238…1c5`, Circle USDC `0x8335…2913`). The mainnet fork suite is kept in the repo; the
+deployment script targets Base Sepolia.
 
 ## Build
 
@@ -535,13 +560,14 @@ src/
     IAavePool.sol              Aave v3 pool subset
     IAggregatorV3.sol          Chainlink feed subset
 test/
-  SuperpositionHookBaseFork.t.sol   Base mainnet fork suite (real v4 + Aave + Chainlink)
-  LiquidityAmounts.t.sol            canonical periphery math
-  ShareMath.t.sol                   share math
-  helpers/TestSwapRouter.sol        minimal v4 swap router for tests
+  BaseSepoliaFork.t.sol            Base Sepolia TESTNET fork suite (deployment target)
+  SuperpositionHookBaseFork.t.sol  Base mainnet fork suite (reference)
+  LiquidityAmounts.t.sol           canonical periphery math
+  ShareMath.t.sol                  share math
+  helpers/TestSwapRouter.sol       minimal v4 swap router for tests
 script/
-  BaseAddresses.sol            verified Base addresses
-  DeployHook.s.sol             deterministic deployment
+  BaseSepoliaAddresses.sol     verified Base Sepolia (TESTNET) addresses
+  DeployHook.s.sol             deterministic testnet deployment (chain-guarded)
 ```
 
 ---
