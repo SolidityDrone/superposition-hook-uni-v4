@@ -4,7 +4,7 @@
 </p>
 
 <p align="center">
-  <img alt="Solidity" src="https://img.shields.io/badge/Solidity-0.8.26-363636?logo=solidity" />
+  <img alt="Solidity" src="https://img.shields.io/badge/Solidity-0.8.30-363636?logo=solidity" />
   <img alt="Foundry" src="https://img.shields.io/badge/Built%20with-Foundry-ffb300" />
   <img alt="Testnet" src="https://img.shields.io/badge/Testnet-Base%20Sepolia%2084532-0052ff" />
   <img alt="Mainnet" src="https://img.shields.io/badge/Also%20fork%20tested-Base%20mainnet-0052ff" />

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.26;
+pragma solidity 0.8.30;
 
 /// @notice Minimal subset of the Aave v3 Pool used by the hook.
 interface IAavePool {

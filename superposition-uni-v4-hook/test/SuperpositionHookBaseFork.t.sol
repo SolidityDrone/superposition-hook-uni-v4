@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.26;
+pragma solidity 0.8.30;
 
 import {Test} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -204,14 +204,19 @@ contract SuperpositionHookBaseForkTest is Test {
     }
 
     function test_fork_withdraw_half() public {
-        (uint256 shares,, uint256 exp0, uint256 exp1,,) = _depositDefault(1e18, 3000e6);
+        (uint256 shares,,,,,) = _depositDefault(1e18, 3000e6);
+
+        SuperpositionHook.Bucket[] memory bs = hook.getBuckets();
+        uint256 c0 = bs[0].c0;
+        uint256 c1 = bs[0].c1;
+        uint256 s = bs[0].shares;
 
         uint256 half = shares / 2;
         vm.prank(lp);
         (uint256 wOut, uint256 uOut) = hook.withdraw(_withdrawParams(half));
 
-        assertApproxEqAbs(wOut, exp0 / 2, 5);
-        assertApproxEqAbs(uOut, exp1 / 2, 5);
+        assertApproxEqAbs(wOut, c0 * half / s, 2);
+        assertApproxEqAbs(uOut, c1 * half / s, 2);
         int24 base = _floor(currentTick, 10);
         assertEq(hook.sharesOf(lp, base - 600, base + 600), shares - half);
     }
