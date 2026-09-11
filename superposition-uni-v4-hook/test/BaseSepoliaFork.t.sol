@@ -12,20 +12,14 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
-import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
-import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 import {SuperpositionHook} from "../src/SuperpositionHook.sol";
 import {IAggregatorV3} from "../src/interfaces/IAggregatorV3.sol";
-import {IAavePool} from "../src/interfaces/IAavePool.sol";
 import {HookMiner} from "../src/libraries/HookMiner.sol";
 import {TestSwapRouter} from "./helpers/TestSwapRouter.sol";
 
 /// @notice Base Sepolia (chain id 84532) fork suite — the testnet deployment target.
-/// @dev Addresses come from Uniswap's v4 deployments and the BGD Labs Aave address book.
-///      Note: Aave's USDC on Base Sepolia is its own test market asset (`0xba50…`), not the
-///      Circle USDC (`0x036C…`); the pool is created with the Aave-supported token so the vault
-///      can actually supply it.
+/// @dev Aave's Base Sepolia USDC is its own test market asset (`0xba50…`), not Circle USDC.
 contract BaseSepoliaForkTest is Test {
     IPoolManager internal constant PM = IPoolManager(0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408);
     address internal constant AAVE = 0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27;
@@ -52,11 +46,11 @@ contract BaseSepoliaForkTest is Test {
                 | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         bytes memory args =
-            abi.encode(PM, AAVE, WETH, USDC, AWETH, AUSDC, ETH_USD, USDC_USD, address(this));
+            abi.encode(PM, AAVE, WETH, USDC, AWETH, AUSDC, uint24(500), int24(10), address(this));
         (address predicted, bytes32 salt) =
             HookMiner.find(address(this), flags, type(SuperpositionHook).creationCode, args);
         hook = new SuperpositionHook{salt: salt}(
-            PM, AAVE, WETH, USDC, AWETH, AUSDC, ETH_USD, USDC_USD, address(this)
+            PM, AAVE, WETH, USDC, AWETH, AUSDC, 500, 10, address(this)
         );
         assertEq(address(hook), predicted);
 
@@ -65,7 +59,6 @@ contract BaseSepoliaForkTest is Test {
         hook.initializePool(sqrtPriceX96);
 
         deal(WETH, lp, 1_000e18);
-        // Aave's test USDC usually supports `deal`; fund the account directly.
         deal(USDC, lp, 5_000_000e6);
         vm.prank(lp);
         IERC20(WETH).approve(address(hook), type(uint256).max);
@@ -76,7 +69,6 @@ contract BaseSepoliaForkTest is Test {
     function _sqrtPriceFromFeeds() internal view returns (uint160) {
         (, int256 ethPrice,,,) = ETH_USD.latestRoundData();
         (, int256 usdcPrice,,,) = USDC_USD.latestRoundData();
-        // WETH is currency0 (18 decimals), USDC currency1 (6 decimals).
         uint256 priceX192 =
             Math.mulDiv(uint256(ethPrice), uint256(1) << 192, uint256(usdcPrice) * 1e12);
         return uint160(Math.sqrt(priceX192));
@@ -98,42 +90,40 @@ contract BaseSepoliaForkTest is Test {
         });
     }
 
-    function test_sepolia_deploy_and_deposit() public {
-        int24 base = _floor(currentTick, 10);
+    function _deposit(int24 lower, int24 upper, uint256 a0, uint256 a1)
+        internal
+        returns (uint256 shares)
+    {
         vm.prank(lp);
-        uint256 shares = hook.deposit(
+        shares = hook.deposit(
             SuperpositionHook.DepositParams({
-                tickLower: base - 600,
-                tickUpper: base + 600,
-                amount0Desired: 1e18,
-                amount1Desired: 3_000e6,
+                tickLower: lower,
+                tickUpper: upper,
+                amount0Desired: a0,
+                amount1Desired: a1,
                 amount0Min: 0,
                 amount1Min: 0,
                 recipient: lp
             })
         );
+    }
+
+    function test_sepolia_deploy_and_deposit() public {
+        int24 base = _floor(currentTick, 10);
+        uint256 shares = _deposit(base - 600, base + 600, 1e18, 3_000e6);
 
         assertGt(shares, 0);
+        assertEq(hook.sharesOf(lp, base - 600, base + 600), shares);
         assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
         assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
-        assertGt(hook.totalAssets(), 0);
+        (uint256 c0, uint256 c1) = hook.totalClaim();
+        assertGt(c0 + c1, 0);
     }
 
     function test_sepolia_jit_swap() public {
         int24 base = _floor(currentTick, 10);
-        vm.prank(lp);
-        hook.deposit(
-            SuperpositionHook.DepositParams({
-                tickLower: base - 600,
-                tickUpper: base + 600,
-                amount0Desired: 1e18,
-                amount1Desired: 3_000e6,
-                amount0Min: 0,
-                amount1Min: 0,
-                recipient: lp
-            })
-        );
+        _deposit(base - 600, base + 600, 1e18, 3_000e6);
 
         TestSwapRouter router = new TestSwapRouter(PM);
         vm.prank(lp);
@@ -151,45 +141,27 @@ contract BaseSepoliaForkTest is Test {
 
     function test_sepolia_withdraw() public {
         int24 base = _floor(currentTick, 10);
-        vm.prank(lp);
-        uint256 shares = hook.deposit(
-            SuperpositionHook.DepositParams({
-                tickLower: base - 600,
-                tickUpper: base + 600,
-                amount0Desired: 1e18,
-                amount1Desired: 3_000e6,
-                amount0Min: 0,
-                amount1Min: 0,
-                recipient: lp
-            })
-        );
+        uint256 shares = _deposit(base - 600, base + 600, 1e18, 3_000e6);
 
         uint256 wBefore = IERC20(WETH).balanceOf(lp);
         vm.prank(lp);
-        (uint256 wOut, uint256 uOut) = hook.withdraw(shares, lp);
+        (uint256 wOut, uint256 uOut) = hook.withdraw(
+            SuperpositionHook.WithdrawParams({
+                tickLower: base - 600, tickUpper: base + 600, shareAmount: shares, recipient: lp
+            })
+        );
 
         assertGt(wOut, 0);
         assertEq(IERC20(WETH).balanceOf(lp) - wBefore, wOut);
-        assertEq(hook.balanceOf(lp), 0);
-        assertEq(hook.totalSupply(), 0);
         assertGt(uOut, 0);
+        assertEq(hook.sharesOf(lp, base - 600, base + 600), 0);
     }
 
     function test_sepolia_usdc_only_limit_order() public {
         int24 base = _floor(currentTick, 10);
-        int24 tickUpper = base - 10; // below spot: USDC only
-        vm.prank(lp);
-        uint256 shares = hook.deposit(
-            SuperpositionHook.DepositParams({
-                tickLower: tickUpper - 600,
-                tickUpper: tickUpper,
-                amount0Desired: 0,
-                amount1Desired: 3_000e6,
-                amount0Min: 0,
-                amount1Min: 0,
-                recipient: lp
-            })
-        );
+        int24 tickUpper = base - 10;
+        int24 tickLower = tickUpper - 600;
+        uint256 shares = _deposit(tickLower, tickUpper, 0, 3_000e6);
 
         assertGt(shares, 0);
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);

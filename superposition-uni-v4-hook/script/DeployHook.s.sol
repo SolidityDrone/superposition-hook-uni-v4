@@ -59,8 +59,8 @@ contract DeployHook is Script {
             BaseSepoliaAddresses.USDC,
             BaseSepoliaAddresses.AWETH,
             BaseSepoliaAddresses.AUSDC,
-            IAggregatorV3(BaseSepoliaAddresses.ETH_USD_FEED),
-            IAggregatorV3(BaseSepoliaAddresses.USDC_USD_FEED),
+            BaseSepoliaAddresses.FEE,
+            BaseSepoliaAddresses.TICK_SPACING,
             owner
         );
     }

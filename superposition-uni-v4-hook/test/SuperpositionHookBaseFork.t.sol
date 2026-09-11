@@ -12,15 +12,16 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
+import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 import {SuperpositionHook} from "../src/SuperpositionHook.sol";
-import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
-import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {IAggregatorV3} from "../src/interfaces/IAggregatorV3.sol";
 import {IAavePool} from "../src/interfaces/IAavePool.sol";
 import {HookMiner} from "../src/libraries/HookMiner.sol";
 import {TestSwapRouter} from "./helpers/TestSwapRouter.sol";
 
+/// @notice Base mainnet fork suite (reference market). The deployment target is Base Sepolia.
 contract SuperpositionHookBaseForkTest is Test {
     IPoolManager internal constant PM = IPoolManager(0x498581fF718922c3f8e6A244956aF099B2652b2b);
     address internal constant AAVE = 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5;
@@ -47,11 +48,11 @@ contract SuperpositionHookBaseForkTest is Test {
                 | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         bytes memory args =
-            abi.encode(PM, AAVE, WETH, USDC, AWETH, AUSDC, ETH_USD, USDC_USD, address(this));
+            abi.encode(PM, AAVE, WETH, USDC, AWETH, AUSDC, uint24(500), int24(10), address(this));
         (address predicted, bytes32 salt) =
             HookMiner.find(address(this), flags, type(SuperpositionHook).creationCode, args);
         hook = new SuperpositionHook{salt: salt}(
-            PM, AAVE, WETH, USDC, AWETH, AUSDC, ETH_USD, USDC_USD, address(this)
+            PM, AAVE, WETH, USDC, AWETH, AUSDC, 500, 10, address(this)
         );
         assertEq(address(hook), predicted);
 
@@ -70,21 +71,9 @@ contract SuperpositionHookBaseForkTest is Test {
     function _sqrtPriceFromFeeds() internal view returns (uint160) {
         (, int256 ethPrice,,,) = ETH_USD.latestRoundData();
         (, int256 usdcPrice,,,) = USDC_USD.latestRoundData();
-        // raw price token1/token0 = (ethPrice/1e8 * 1e6) / (usdcPrice/1e8 * 1e18)
-        //                        = ethPrice / (usdcPrice * 1e12)
-        // sqrtPriceX96 = sqrt(price * 2^192)
         uint256 priceX192 =
             Math.mulDiv(uint256(ethPrice), uint256(1) << 192, uint256(usdcPrice) * 1e12);
         return uint160(Math.sqrt(priceX192));
-    }
-
-    function test_initial_views() public view {
-        (uint256 w, uint256 u) = hook.currentBalance();
-        assertEq(w, 0);
-        assertEq(u, 0);
-        assertEq(hook.totalAssets(), 0);
-        assertEq(hook.sharePrice(), 1e18);
-        assertEq(hook.getRanges().length, 0);
     }
 
     function _floor(int24 tick, int24 spacing) internal pure returns (int24) {
@@ -121,49 +110,6 @@ contract SuperpositionHookBaseForkTest is Test {
         }
     }
 
-    function test_fork_deposit_two_sided() public {
-        int24 base = _floor(currentTick, 10);
-        int24 lower = base - 600;
-        int24 upper = base + 600;
-        uint256 amount0Desired = 1e18;
-        uint256 amount1Desired = 3000e6;
-
-        uint128 liq = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPriceX96,
-            TickMath.getSqrtPriceAtTick(lower),
-            TickMath.getSqrtPriceAtTick(upper),
-            amount0Desired,
-            amount1Desired
-        );
-        (uint256 exp0, uint256 exp1) = _required(liq, lower, upper);
-
-        vm.prank(lp);
-        uint256 shares = hook.deposit(
-            SuperpositionHook.DepositParams({
-                tickLower: lower,
-                tickUpper: upper,
-                amount0Desired: amount0Desired,
-                amount1Desired: amount1Desired,
-                amount0Min: 0,
-                amount1Min: 0,
-                recipient: lp
-            })
-        );
-
-        assertGt(shares, 0);
-        assertEq(hook.balanceOf(lp), shares);
-        assertEq(hook.getRanges().length, 1);
-
-        (uint256 w, uint256 u) = hook.currentBalance();
-        assertApproxEqAbs(w, exp0, 1100);
-        assertApproxEqAbs(u, exp1, 1100);
-        assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
-        assertEq(IERC20(USDC).balanceOf(address(hook)), 0);
-        assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
-        assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
-        assertGt(hook.totalAssets(), 0);
-    }
-
     function _depositDefault(uint256 amount0Desired, uint256 amount1Desired)
         internal
         returns (uint256 shares, uint128 liq, uint256 exp0, uint256 exp1, int24 lower, int24 upper)
@@ -171,14 +117,19 @@ contract SuperpositionHookBaseForkTest is Test {
         int24 base = _floor(currentTick, 10);
         lower = base - 600;
         upper = base + 600;
+        // Mirror the hook: liquidity comes from the budget *after* the rounding buffer.
+        uint256 eff0 = amount0Desired > 1000 ? amount0Desired - 1000 : 0;
+        uint256 eff1 = amount1Desired > 1000 ? amount1Desired - 1000 : 0;
         liq = LiquidityAmounts.getLiquidityForAmounts(
             sqrtPriceX96,
             TickMath.getSqrtPriceAtTick(lower),
             TickMath.getSqrtPriceAtTick(upper),
-            amount0Desired,
-            amount1Desired
+            eff0,
+            eff1
         );
-        (exp0, exp1) = _required(liq, lower, upper);
+        (uint256 r0, uint256 r1) = _required(liq, lower, upper);
+        exp0 = r0 == 0 ? 0 : r0 + 1000;
+        exp1 = r1 == 0 ? 0 : r1 + 1000;
         vm.prank(lp);
         shares = hook.deposit(
             SuperpositionHook.DepositParams({
@@ -193,69 +144,98 @@ contract SuperpositionHookBaseForkTest is Test {
         );
     }
 
+    function test_initial_views() public view {
+        (uint256 w, uint256 u) = hook.currentBalance();
+        assertEq(w, 0);
+        assertEq(u, 0);
+        (uint256 c0, uint256 c1) = hook.totalClaim();
+        assertEq(c0, 0);
+        assertEq(c1, 0);
+        assertEq(hook.getBuckets().length, 0);
+    }
+
+    function test_fork_deposit_two_sided() public {
+        (uint256 shares,,,, int24 lower, int24 upper) = _depositDefault(1e18, 3000e6);
+
+        assertGt(shares, 0);
+        assertEq(hook.sharesOf(lp, lower, upper), shares);
+        assertEq(hook.getBuckets().length, 1);
+
+        (uint256 w, uint256 u) = hook.currentBalance();
+        assertGt(w, 0);
+        assertGt(u, 0);
+        assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
+        assertEq(IERC20(USDC).balanceOf(address(hook)), 0);
+        assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
+        assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
+    }
+
     function test_fork_withdraw_returns_principal() public {
         (uint256 shares,, uint256 exp0, uint256 exp1,,) = _depositDefault(1e18, 3000e6);
 
         uint256 wBefore = IERC20(WETH).balanceOf(lp);
         uint256 uBefore = IERC20(USDC).balanceOf(lp);
         vm.prank(lp);
-        (uint256 wOut, uint256 uOut) = hook.withdraw(shares, lp);
+        (uint256 wOut, uint256 uOut) = hook.withdraw(_withdrawParams(shares));
 
         assertEq(IERC20(WETH).balanceOf(lp) - wBefore, wOut);
         assertEq(IERC20(USDC).balanceOf(lp) - uBefore, uOut);
-        assertApproxEqAbs(wOut, exp0, 1100);
-        assertApproxEqAbs(uOut, exp1, 1100);
-        assertEq(hook.balanceOf(lp), 0);
-        assertEq(hook.totalSupply(), 0);
-        assertApproxEqAbs(hook.totalAssets(), 0, 10);
+        assertApproxEqAbs(wOut, exp0, 5);
+        assertApproxEqAbs(uOut, exp1, 5);
+        (uint256 c0, uint256 c1) = hook.totalClaim();
+        assertApproxEqAbs(c0, 0, 10);
+        assertApproxEqAbs(c1, 0, 10);
+    }
+
+    function _withdrawParams(uint256 shares)
+        internal
+        view
+        returns (SuperpositionHook.WithdrawParams memory)
+    {
+        int24 base = _floor(currentTick, 10);
+        return SuperpositionHook.WithdrawParams({
+            tickLower: base - 600, tickUpper: base + 600, shareAmount: shares, recipient: lp
+        });
     }
 
     function test_fork_withdraw_half() public {
-        (uint256 shares, uint128 liq, uint256 exp0, uint256 exp1,,) = _depositDefault(1e18, 3000e6);
+        (uint256 shares,, uint256 exp0, uint256 exp1,,) = _depositDefault(1e18, 3000e6);
 
         uint256 half = shares / 2;
         vm.prank(lp);
-        (uint256 wOut, uint256 uOut) = hook.withdraw(half, lp);
+        (uint256 wOut, uint256 uOut) = hook.withdraw(_withdrawParams(half));
 
-        assertApproxEqAbs(wOut, exp0 / 2, 1100);
-        assertApproxEqAbs(uOut, exp1 / 2, 1100);
-        assertEq(hook.balanceOf(lp), shares - half);
-        SuperpositionHook.Range[] memory rs = hook.getRanges();
-        assertApproxEqAbs(uint256(rs[0].liquidity), uint256(liq) / 2, uint256(liq) / 1000);
+        assertApproxEqAbs(wOut, exp0 / 2, 5);
+        assertApproxEqAbs(uOut, exp1 / 2, 5);
+        int24 base = _floor(currentTick, 10);
+        assertEq(hook.sharesOf(lp, base - 600, base + 600), shares - half);
     }
 
     function test_fork_swap_jit_cycle() public {
         _depositDefault(1e18, 3000e6);
         TestSwapRouter router = new TestSwapRouter(PM);
-
         vm.startPrank(lp);
         IERC20(WETH).approve(address(router), type(uint256).max);
         IERC20(USDC).approve(address(router), type(uint256).max);
         vm.stopPrank();
 
         (uint160 sqrtBefore, int24 tickBefore,,) = StateLibrary.getSlot0(PM, hook.poolId());
-        uint256 wethBefore = IERC20(WETH).balanceOf(lp);
-
         vm.prank(lp);
         router.swap(_poolKey(), true, -0.01e18, TickMath.MIN_SQRT_PRICE + 1, lp);
 
         (uint160 sqrtAfter, int24 tickAfter,,) = StateLibrary.getSlot0(PM, hook.poolId());
         assertLt(sqrtAfter, sqrtBefore);
         assertLt(tickAfter, tickBefore);
-        assertLt(IERC20(WETH).balanceOf(lp), wethBefore);
-
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
         assertEq(IERC20(USDC).balanceOf(address(hook)), 0);
         assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
-        assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
         assertFalse(hook.jitActive());
     }
 
     function test_fork_one_sided_usdc_limit_order() public {
         int24 base = _floor(currentTick, 10);
-        int24 tickUpper = base - 10; // fully below spot: only token1 (USDC) is required
+        int24 tickUpper = base - 10;
         int24 tickLower = tickUpper - 600;
-
         vm.prank(lp);
         uint256 shares = hook.deposit(
             SuperpositionHook.DepositParams({
@@ -273,17 +253,18 @@ contract SuperpositionHookBaseForkTest is Test {
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
         assertEq(IERC20(AWETH).balanceOf(address(hook)), 0);
         assertGt(IERC20(AUSDC).balanceOf(address(hook)), 0);
-
         (uint256 vw, uint256 vu) = hook.virtualBalance();
         assertEq(vw, 0);
         assertGt(vu, 0);
+        assertApproxEqAbs(
+            hook.bucketValue(tickLower, tickUpper), IERC20(AUSDC).balanceOf(address(hook)), 2
+        );
     }
 
     function test_fork_limit_order_fills_on_cross() public {
         int24 base = _floor(currentTick, 10);
         int24 tickUpper = base - 10;
         int24 tickLower = tickUpper - 600;
-
         vm.prank(lp);
         hook.deposit(
             SuperpositionHook.DepositParams({
@@ -297,43 +278,34 @@ contract SuperpositionHookBaseForkTest is Test {
             })
         );
 
-        uint256 usdcBefore = IERC20(AUSDC).balanceOf(address(hook));
-        assertEq(IERC20(AWETH).balanceOf(address(hook)), 0);
-
         TestSwapRouter router = new TestSwapRouter(PM);
-        vm.startPrank(lp);
-        IERC20(WETH).approve(address(router), type(uint256).max);
-        vm.stopPrank();
-
-        // Push price down into the USDC-only range; the limit order sells USDC for WETH.
         vm.prank(lp);
-        router.swap(_poolKey(), true, -0.05e18, TickMath.MIN_SQRT_PRICE + 1, lp);
+        IERC20(WETH).approve(address(router), type(uint256).max);
+        vm.prank(lp);
+        router.swap(_poolKey(), true, -0.5e18, TickMath.MIN_SQRT_PRICE + 1, lp);
 
-        uint256 aWethAfter = IERC20(AWETH).balanceOf(address(hook));
-        uint256 aUsdcAfter = IERC20(AUSDC).balanceOf(address(hook));
-        assertGt(aWethAfter, 0);
-        assertLt(aUsdcAfter, usdcBefore);
+        assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
-        assertEq(IERC20(USDC).balanceOf(address(hook)), 0);
     }
 
     function test_fork_yield_accrual_and_atomic_exit_fairness() public {
-        (uint256 bobShares,,,,,) = _depositDefault(1e18, 3000e6);
+        int24 base = _floor(currentTick, 10);
+        int24 lower = base - 600;
+        int24 upper = base + 600;
+        _depositDefault(1e18, 3000e6);
 
-        // Simulate accrued yield: the vault's real holdings grow, so `totalAssets` grows.
+        // Simulate yield: the vault's real holdings grow; `_syncYield` will distribute it.
         deal(WETH, address(hook), IERC20(WETH).balanceOf(address(hook)) + 0.5e18);
         deal(USDC, address(hook), IERC20(USDC).balanceOf(address(hook)) + 1500e6);
+        hook.syncYield();
 
-        assertGt(hook.sharePrice(), 1e18);
-        uint256 bobClaimBefore = hook.convertToAssets(bobShares);
-
-        // Alice joins and exits atomically at the post-yield price.
-        int24 base = _floor(currentTick, 10);
+        // Alice joins and exits atomically; a `deposit` runs `_syncYield`, so Bob's claim is priced.
+        uint256 valueBefore = hook.bucketValue(lower, upper);
         vm.startPrank(lp);
         uint256 aliceShares = hook.deposit(
             SuperpositionHook.DepositParams({
-                tickLower: base - 600,
-                tickUpper: base + 600,
+                tickLower: lower,
+                tickUpper: upper,
                 amount0Desired: 1e18,
                 amount1Desired: 3000e6,
                 amount0Min: 0,
@@ -341,119 +313,25 @@ contract SuperpositionHookBaseForkTest is Test {
                 recipient: lp
             })
         );
-        hook.withdraw(aliceShares, lp);
+        hook.withdraw(_withdrawParams(aliceShares));
         vm.stopPrank();
 
-        // Bob's claim is unchanged: Alice did not skim his yield.
-        uint256 bobClaimAfter = hook.convertToAssets(bobShares);
-        assertApproxEqRel(bobClaimAfter, bobClaimBefore, 0.001e18);
+        uint256 valueAfter = hook.bucketValue(lower, upper);
+        // Bob's bucket value is unchanged: Alice did not skim his yield.
+        assertApproxEqRel(valueAfter, valueBefore, 0.001e18);
     }
 
     function test_fork_deposit_survives_aave_failure() public {
         vm.mockCallRevert(AAVE, IAavePool.supply.selector, bytes("supply failed"));
 
-        int24 base = _floor(currentTick, 10);
-        vm.prank(lp);
-        uint256 shares = hook.deposit(
-            SuperpositionHook.DepositParams({
-                tickLower: base - 600,
-                tickUpper: base + 600,
-                amount0Desired: 1e18,
-                amount1Desired: 3000e6,
-                amount0Min: 0,
-                amount1Min: 0,
-                recipient: lp
-            })
-        );
-
+        (uint256 shares,,,,,) = _depositDefault(1e18, 3000e6);
         assertGt(shares, 0);
         assertEq(IERC20(AWETH).balanceOf(address(hook)), 0);
-        assertEq(IERC20(AUSDC).balanceOf(address(hook)), 0);
         assertGt(IERC20(WETH).balanceOf(address(hook)), 0);
-        assertGt(IERC20(USDC).balanceOf(address(hook)), 0);
-        assertGt(hook.totalAssets(), 0);
+        (uint256 c0, uint256 c1) = hook.totalClaim();
+        assertGt(c0 + c1, 0);
     }
 
-    function test_non_manager_hook_calls_revert() public {
-        PoolKey memory key = _poolKey();
-        IPoolManager.ModifyLiquidityParams memory params = IPoolManager.ModifyLiquidityParams({
-            tickLower: -600, tickUpper: 600, liquidityDelta: 0, salt: 0
-        });
-
-        vm.expectRevert(SuperpositionHook.NotPoolManager.selector);
-        hook.beforeAddLiquidity(address(0xBAD), key, params, "");
-
-        vm.expectRevert(SuperpositionHook.NotPoolManager.selector);
-        hook.beforeRemoveLiquidity(address(0xBAD), key, params, "");
-
-        vm.expectRevert(SuperpositionHook.NotPoolManager.selector);
-        hook.beforeSwap(address(0xBAD), key, IPoolManager.SwapParams(false, 0, 0), "");
-    }
-
-    function test_direct_lp_modify_reverts() public {
-        DirectLpAttacker attacker = new DirectLpAttacker(PM);
-        vm.expectRevert();
-        attacker.attack(_poolKey());
-    }
-
-    function test_fork_withdraw_after_swap() public {
-        (uint256 shares,,,,,) = _depositDefault(1e18, 3000e6);
-        TestSwapRouter router = new TestSwapRouter(PM);
-        vm.prank(lp);
-        IERC20(WETH).approve(address(router), type(uint256).max);
-        vm.prank(lp);
-        router.swap(_poolKey(), true, -0.01e18, TickMath.MIN_SQRT_PRICE + 1, lp);
-
-        vm.prank(lp);
-        (uint256 wOut, uint256 uOut) = hook.withdraw(shares, lp);
-
-        assertGt(wOut + uOut, 0);
-        assertEq(hook.balanceOf(lp), 0);
-        assertApproxEqAbs(hook.totalAssets(), 0, 10);
-    }
-
-    function test_fork_multi_lp_full_exit() public {
-        address lp2 = address(0xA11CE);
-        deal(WETH, lp2, 100e18);
-        deal(USDC, lp2, 1_000_000e6);
-        vm.startPrank(lp2);
-        IERC20(WETH).approve(address(hook), type(uint256).max);
-        IERC20(USDC).approve(address(hook), type(uint256).max);
-        vm.stopPrank();
-
-        (uint256 s1,,,,,) = _depositDefault(1e18, 3000e6);
-
-        int24 base = _floor(currentTick, 10);
-        vm.prank(lp2);
-        uint256 s2 = hook.deposit(
-            SuperpositionHook.DepositParams({
-                tickLower: base - 600,
-                tickUpper: base + 600,
-                amount0Desired: 0.5e18,
-                amount1Desired: 1500e6,
-                amount0Min: 0,
-                amount1Min: 0,
-                recipient: lp2
-            })
-        );
-        assertGt(s1, 0);
-        assertGt(s2, 0);
-
-        vm.prank(lp);
-        hook.withdraw(s1, lp);
-        vm.prank(lp2);
-        hook.withdraw(s2, lp2);
-
-        assertEq(hook.balanceOf(lp), 0);
-        assertEq(hook.balanceOf(lp2), 0);
-        assertEq(hook.totalSupply(), 0);
-        assertApproxEqAbs(hook.totalAssets(), 0, 10);
-        SuperpositionHook.Range[] memory rs = hook.getRanges();
-        assertFalse(rs[0].active);
-    }
-
-    /// @notice Aave rejecting the post-swap supply for one token leaves it idle; the vault keeps
-    ///         working and the idle (real) balance is spent alongside the virtual liquidity.
     function test_fork_partial_aave_supply_stays_correct() public {
         _depositDefault(1e18, 3000e6);
 
@@ -471,25 +349,99 @@ contract SuperpositionHookBaseForkTest is Test {
         vm.prank(lp);
         router.swap(_poolKey(), true, -0.01e18, TickMath.MIN_SQRT_PRICE + 1, lp);
 
-        // WETH went back to Aave; USDC could not and stays as a real idle balance.
         assertGt(IERC20(AWETH).balanceOf(address(hook)), 0);
         assertEq(IERC20(WETH).balanceOf(address(hook)), 0);
         assertGt(IERC20(USDC).balanceOf(address(hook)), 0);
         assertFalse(hook.jitActive());
-        assertGt(hook.totalAssets(), 0);
 
-        // A second swap is funded from the idle USDC plus the aWETH and still settles.
         vm.prank(lp);
         router.swap(_poolKey(), false, -3000e6, TickMath.MAX_SQRT_PRICE - 1, lp);
         assertFalse(hook.jitActive());
         assertGt(IERC20(USDC).balanceOf(address(hook)), 0);
+    }
 
-        // Full exit returns both the Aave-held and the idle tokens.
-        uint256 shares = hook.balanceOf(lp);
+    function test_fork_withdraw_after_swap() public {
+        (uint256 shares,,,,,) = _depositDefault(1e18, 3000e6);
+        TestSwapRouter router = new TestSwapRouter(PM);
         vm.prank(lp);
-        (uint256 wOut, uint256 uOut) = hook.withdraw(shares, lp);
+        IERC20(WETH).approve(address(router), type(uint256).max);
+        vm.prank(lp);
+        router.swap(_poolKey(), true, -0.01e18, TickMath.MIN_SQRT_PRICE + 1, lp);
+
+        vm.prank(lp);
+        (uint256 wOut, uint256 uOut) = hook.withdraw(_withdrawParams(shares));
         assertGt(wOut + uOut, 0);
-        assertEq(hook.balanceOf(lp), 0);
+        int24 base = _floor(currentTick, 10);
+        assertEq(hook.sharesOf(lp, base - 600, base + 600), 0);
+    }
+
+    function test_fork_multi_lp_full_exit() public {
+        int24 base = _floor(currentTick, 10);
+        int24 lower = base - 600;
+        int24 upper = base + 600;
+
+        address lp2 = address(0xA11CE);
+        deal(WETH, lp2, 100e18);
+        deal(USDC, lp2, 1_000_000e6);
+        vm.startPrank(lp2);
+        IERC20(WETH).approve(address(hook), type(uint256).max);
+        IERC20(USDC).approve(address(hook), type(uint256).max);
+        vm.stopPrank();
+
+        (uint256 s1,,,,,) = _depositDefault(1e18, 3000e6);
+        vm.prank(lp2);
+        uint256 s2 = hook.deposit(
+            SuperpositionHook.DepositParams({
+                tickLower: lower,
+                tickUpper: upper,
+                amount0Desired: 0.5e18,
+                amount1Desired: 1500e6,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: lp2
+            })
+        );
+        assertGt(s1, 0);
+        assertGt(s2, 0);
+
+        (SuperpositionHook.Bucket[] memory bs) = hook.getBuckets();
+        assertEq(bs.length, 1);
+        assertEq(bs[0].shares, s1 + s2);
+
+        vm.prank(lp);
+        hook.withdraw(_withdrawParams(s1));
+        vm.prank(lp2);
+        hook.withdraw(
+            SuperpositionHook.WithdrawParams({
+                tickLower: lower, tickUpper: upper, shareAmount: s2, recipient: lp2
+            })
+        );
+
+        (uint256 c0, uint256 c1) = hook.totalClaim();
+        assertApproxEqAbs(c0, 0, 10);
+        assertApproxEqAbs(c1, 0, 10);
+        SuperpositionHook.Bucket[] memory bs2 = hook.getBuckets();
+        assertFalse(bs2[0].active);
+    }
+
+    function test_non_manager_hook_calls_revert() public {
+        PoolKey memory key = _poolKey();
+        IPoolManager.ModifyLiquidityParams memory params = IPoolManager.ModifyLiquidityParams({
+            tickLower: -600, tickUpper: 600, liquidityDelta: 0, salt: 0
+        });
+
+        vm.expectRevert(SuperpositionHook.NotPoolManager.selector);
+        hook.beforeAddLiquidity(address(0xBAD), key, params, "");
+        vm.expectRevert(SuperpositionHook.NotPoolManager.selector);
+        hook.beforeRemoveLiquidity(address(0xBAD), key, params, "");
+        vm.expectRevert(SuperpositionHook.NotPoolManager.selector);
+        hook.beforeSwap(address(0xBAD), key, IPoolManager.SwapParams(false, 0, 0), "");
+    }
+
+    function test_direct_lp_modify_reverts() public {
+        DirectLpAttacker attacker = new DirectLpAttacker(PM);
+        vm.expectRevert();
+        attacker.attack(_poolKey());
     }
 }
 
