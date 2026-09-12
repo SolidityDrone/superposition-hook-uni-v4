@@ -30,6 +30,20 @@ The hook is **protocol-agnostic and pair-agnostic**:
 - Each side can be any ERC-4626 vault: Morpho, Euler v2, Spark Savings, Yearn, or an **Aave
   ERC-4626 wrapper** — in any combination (`aave/morpho`, `morpho/euler`, ...).
 
+## For reviewers
+
+Developer feedback for the Uniswap track: [`FEEDBACK.md`](./FEEDBACK.md).
+
+| Integration point | Location |
+|---|---|
+| `beforeSwap` / `afterSwap` | `src/SuperpositionHook.sol:556`, `:604` |
+| `beforeAddLiquidity` / `beforeRemoveLiquidity` | `src/SuperpositionHook.sol:503`, `:527` |
+| Hook permission flags | `script/DeployHook.s.sol:29` |
+| `modifyLiquidity` (JIT add / remove) | `src/SuperpositionHook.sol:576`, `:619` |
+| ERC-4626 custody | `src/SuperpositionHook.sol:734`, `:745`, `:758` |
+| CREATE2 hook mining | `src/libraries/HookMiner.sol:25` |
+| ERC-1155 bucket shares | `src/BucketShares.sol:11` |
+
 ## How it works, end to end
 
 ```
